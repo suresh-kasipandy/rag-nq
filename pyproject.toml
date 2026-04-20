@@ -1,0 +1,31 @@
+[project]
+name = "rag-nq-showcase"
+version = "0.1.0"
+description = "Passage-oriented RAG indexing showcase on NQ-retrieval"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=2.20.0",
+    "numpy>=1.26.0",
+    "pydantic>=2.7.0",
+    "qdrant-client>=1.10.0",
+    "rank-bm25>=0.2.2",
+    "sentence-transformers>=3.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+    "ruff>=0.6.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

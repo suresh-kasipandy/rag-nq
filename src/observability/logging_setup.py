@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 
@@ -27,6 +29,26 @@ def get_stage_logger(name: str) -> StageLoggerAdapter:
     """Return a logger that supports ``logger.info(..., extra={\"stage\": \"ingest\"})``."""
 
     return StageLoggerAdapter(get_logger(name), {})
+
+
+@contextmanager
+def quiet_http_clients(level: int = logging.WARNING) -> Iterator[None]:
+    """Lower log noise from HTTP stacks while Hugging Face / CDN downloads run.
+
+    Restores prior levels on exit so later Qdrant or other HTTP clients stay configurable.
+    """
+
+    names = ("httpx", "httpcore")
+    previous: dict[str, int] = {}
+    for name in names:
+        log = logging.getLogger(name)
+        previous[name] = log.level
+        log.setLevel(level)
+    try:
+        yield
+    finally:
+        for name in names:
+            logging.getLogger(name).setLevel(previous[name])
 
 
 def setup_logging(level: int = logging.INFO) -> None:

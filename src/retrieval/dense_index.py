@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from src.config.settings import Settings
 from src.ingestion.models import Passage
+
+LOGGER = logging.getLogger(__name__)
+
+_UPSERT_RETRY_MAX_ATTEMPTS = 3
+_UPSERT_RETRY_BASE_SLEEP_SECONDS = 1.0
+_DENSE_CHECKPOINT_SCHEMA_VERSION = "1"
 
 
 class EmbeddingModel(Protocol):
@@ -28,7 +40,7 @@ class QdrantLikeClient(Protocol):
 
     def create_collection(self, collection_name: str, vectors_config: Any) -> None: ...
 
-    def upsert(self, collection_name: str, points: list[dict[str, Any]]) -> None: ...
+    def upsert(self, collection_name: str, points: list[Any]) -> None: ...
 
     def count(self, collection_name: str, exact: bool = True) -> Any: ...
 
@@ -96,6 +108,89 @@ class DenseIndexer:
         vector_size = len(points[0]["vector"][self._settings.qdrant_vector_name]) if points else 0
         return DenseBuildResult(vector_count=len(points), vector_size=vector_size)
 
+    def build_from_jsonl_streaming(
+        self,
+        jsonl_path: Path,
+        *,
+        lines_per_batch: int,
+        max_passages: int | None = None,
+    ) -> DenseBuildResult:
+        """Encode and upsert passages by reading silver JSONL in bounded line batches.
+
+        When ``max_passages`` is set, only the first N non-empty silver lines are indexed.
+        """
+
+        self._ensure_collection(vector_size=self._embedding_dimension())
+        checkpoint_path = self._settings.dense_checkpoint_path
+        resume_count = _load_dense_checkpoint(
+            path=checkpoint_path,
+            silver_path=jsonl_path,
+            collection_name=self._settings.qdrant_collection,
+            vector_name=self._settings.qdrant_vector_name,
+            max_passages=max_passages,
+        )
+        if resume_count:
+            LOGGER.info("resuming dense from checkpoint at %s passages", resume_count)
+        vector_size = 0
+        total_vectors = resume_count
+        batch: list[Passage] = []
+        consumed_non_empty_lines = 0
+
+        def flush() -> None:
+            nonlocal vector_size, total_vectors, batch
+            if not batch:
+                return
+            texts = [p.text for p in batch]
+            vectors = self._model.encode(
+                texts,
+                batch_size=self._settings.embedding_batch_size,
+                normalize_embeddings=True,
+            )
+            points = [
+                {
+                    "id": passage.passage_id,
+                    "vector": {self._settings.qdrant_vector_name: list(vector)},
+                    "payload": _qdrant_payload(passage),
+                }
+                for passage, vector in zip(batch, vectors, strict=True)
+            ]
+            _upsert_with_retry(
+                client=self._client,
+                collection_name=self._settings.qdrant_collection,
+                points=points,
+            )
+            total_vectors += len(points)
+            _write_dense_checkpoint(
+                path=checkpoint_path,
+                silver_path=jsonl_path,
+                collection_name=self._settings.qdrant_collection,
+                vector_name=self._settings.qdrant_vector_name,
+                max_passages=max_passages,
+                indexed_count=total_vectors,
+            )
+            if points:
+                vec_key = self._settings.qdrant_vector_name
+                vector_size = len(points[0]["vector"][vec_key])
+            batch = []
+
+        with jsonl_path.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                if max_passages is not None and total_vectors + len(batch) >= max_passages:
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                if consumed_non_empty_lines < resume_count:
+                    consumed_non_empty_lines += 1
+                    continue
+                batch.append(Passage.model_validate_json(line))
+                if len(batch) >= lines_per_batch:
+                    flush()
+        flush()
+        _remove_dense_checkpoint(checkpoint_path)
+
+        return DenseBuildResult(vector_count=total_vectors, vector_size=vector_size)
+
     def count(self) -> int:
         """Return number of vectors in collection."""
 
@@ -105,12 +200,19 @@ class DenseIndexer:
     def _ensure_collection(self, vector_size: int) -> None:
         if self._client.collection_exists(self._settings.qdrant_collection):
             return
+        from qdrant_client.http import models as qm
+
         self._client.create_collection(
             collection_name=self._settings.qdrant_collection,
-            vectors_config=_build_vector_params(
-                size=vector_size,
-                distance_name=self._settings.qdrant_distance,
-            ),
+            vectors_config={
+                self._settings.qdrant_vector_name: _build_vector_params(
+                    size=vector_size,
+                    distance_name=self._settings.qdrant_distance,
+                )
+            },
+            sparse_vectors_config={
+                self._settings.qdrant_sparse_vector_name: qm.SparseVectorParams(),
+            },
         )
 
     def _embedding_dimension(self) -> int:
@@ -125,7 +227,10 @@ def _build_default_qdrant_client(url: str) -> Any:
             "qdrant-client is required for dense indexing. Install project dependencies first."
         ) from exc
 
-    return QdrantClient(url=url)
+    try:
+        return QdrantClient(url=url, check_compatibility=False)
+    except TypeError:
+        return QdrantClient(url=url)
 
 
 def _build_default_embedding_model(model_name: str) -> EmbeddingModel:
@@ -140,7 +245,98 @@ def _build_default_embedding_model(model_name: str) -> EmbeddingModel:
     return SentenceTransformer(model_name)
 
 
+def _upsert_with_retry(
+    *, client: QdrantLikeClient, collection_name: str, points: list[Any]
+) -> None:
+    """Best-effort retry wrapper for transient upsert failures (timeouts, temporary overload)."""
+
+    delay = _UPSERT_RETRY_BASE_SLEEP_SECONDS
+    for attempt in range(1, _UPSERT_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            client.upsert(collection_name=collection_name, points=points)
+            return
+        except Exception:
+            if attempt >= _UPSERT_RETRY_MAX_ATTEMPTS:
+                raise
+            LOGGER.warning(
+                "qdrant upsert failed (attempt %s/%s); retrying in %.1fs",
+                attempt,
+                _UPSERT_RETRY_MAX_ATTEMPTS,
+                delay,
+            )
+            time.sleep(delay)
+            delay *= 2.0
+
+
+def _remove_dense_checkpoint(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _load_dense_checkpoint(
+    *,
+    path: Path,
+    silver_path: Path,
+    collection_name: str,
+    vector_name: str,
+    max_passages: int | None,
+) -> int:
+    if not path.is_file():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    expected = {
+        "schema_version": _DENSE_CHECKPOINT_SCHEMA_VERSION,
+        "silver_path": str(silver_path.resolve()),
+        "collection_name": collection_name,
+        "vector_name": vector_name,
+        "max_passages": max_passages,
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            return 0
+    indexed_count = payload.get("indexed_count")
+    if not isinstance(indexed_count, int) or indexed_count < 0:
+        return 0
+    return indexed_count
+
+
+def _write_dense_checkpoint(
+    *,
+    path: Path,
+    silver_path: Path,
+    collection_name: str,
+    vector_name: str,
+    max_passages: int | None,
+    indexed_count: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    payload = {
+        "schema_version": _DENSE_CHECKPOINT_SCHEMA_VERSION,
+        "silver_path": str(silver_path.resolve()),
+        "collection_name": collection_name,
+        "vector_name": vector_name,
+        "max_passages": max_passages,
+        "indexed_count": indexed_count,
+        "updated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
+    }
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
 def _build_vector_params(size: int, distance_name: str) -> Any:
     from qdrant_client.http import models as qm
 
-    return qm.VectorParams(size=size, distance=getattr(qm.Distance, distance_name))
+    # qdrant-client 1.13+: ``Distance.COSINE``; settings keep title case (``Cosine``).
+    attr = distance_name.upper()
+    return qm.VectorParams(size=size, distance=getattr(qm.Distance, attr))

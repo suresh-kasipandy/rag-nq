@@ -12,7 +12,7 @@ def test_load_nq_passages_preserves_passage_boundaries(monkeypatch: pytest.Monke
         {"id": "p2", "text": "Second passage.", "title": "Doc 2"},
     ]
 
-    def fake_load_dataset(name: str, split: str):
+    def fake_load_dataset(name: str, split: str, **_kwargs: object):
         assert name == "sentence-transformers/NQ-retrieval"
         assert split == "train"
         return rows

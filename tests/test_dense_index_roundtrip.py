@@ -24,10 +24,16 @@ class FakeQdrantClient:
     def collection_exists(self, collection_name: str) -> bool:
         return self.exists
 
-    def create_collection(self, collection_name: str, vectors_config) -> None:
+    def create_collection(
+        self, collection_name: str, vectors_config, sparse_vectors_config=None, **kwargs
+    ) -> None:
         self.exists = True
         if isinstance(vectors_config, dict):
-            assert vectors_config["size"] == 3
+            named = vectors_config["dense"]
+            if isinstance(named, dict):
+                assert named["size"] == 3
+            else:
+                assert getattr(named, "size", None) == 3
         else:
             assert getattr(vectors_config, "size", None) == 3
 

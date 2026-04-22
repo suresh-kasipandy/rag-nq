@@ -26,8 +26,8 @@ def test_write_manifest_is_stable_json(tmp_path) -> None:
         dataset_split="train",
         embedding_model_name="sentence-transformers/all-MiniLM-L6-v2",
         passage_count=10,
-        qdrant_collection="nq_passages_dense",
-        sparse_index_path="artifacts/bm25.pkl",
+        qdrant_collection="nq_passages",
+        sparse_index_path="artifacts/sparse_index_manifest.json",
     )
     path = tmp_path / "manifest.json"
     PassageStore.write_manifest(manifest, path)
@@ -35,4 +35,4 @@ def test_write_manifest_is_stable_json(tmp_path) -> None:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     assert payload["passage_count"] == 10
-    assert payload["qdrant_collection"] == "nq_passages_dense"
+    assert payload["qdrant_collection"] == "nq_passages"

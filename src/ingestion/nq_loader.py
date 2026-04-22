@@ -2,14 +2,52 @@
 
 from __future__ import annotations
 
+import os
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+
+from tqdm import tqdm
 
 from src.config.settings import Settings
 from src.ingestion.models import Passage
+from src.observability.logging_setup import quiet_http_clients
 
 # Stable namespace for synthetic passage IDs (UUID v5).
 _PASSAGE_ID_NAMESPACE = uuid.UUID("018f0884-e1c7-7e4f-a9c2-0f6b2a8d4e10")
+
+
+def iter_nq_passages(settings: Settings) -> Iterator[Passage]:
+    """Yield passages from the configured NQ-retrieval split without materializing the full list.
+
+    Semantics match :func:`load_nq_passages` but stream one :class:`Passage` at a time for
+    Milestone 2 silver writes and bounded-memory ingest.
+    """
+
+    with quiet_http_clients():
+        raw_split = _load_dataset(
+            settings.dataset_name,
+            settings.dataset_split,
+            streaming=settings.dataset_streaming,
+        )
+        row_iter: Iterable[object] = raw_split
+        if _ingest_progress_enabled(settings):
+            row_total = _try_split_num_examples(settings.dataset_name, settings.dataset_split)
+            row_iter = tqdm(
+                raw_split,
+                desc="Dataset rows",
+                unit="row",
+                total=row_total,
+                mininterval=0.5,
+            )
+
+        yielded = 0
+        for row_ordinal, row in enumerate(row_iter):
+            row_mapping = _as_mapping(row)
+            for passage in _passages_from_row(row_mapping, row_ordinal, settings):
+                yield passage
+                yielded += 1
+                if settings.max_passages is not None and yielded >= settings.max_passages:
+                    return
 
 
 def load_nq_passages(settings: Settings) -> list[Passage]:
@@ -19,18 +57,40 @@ def load_nq_passages(settings: Settings) -> list[Passage]:
     are expanded into one :class:`Passage` per non-empty candidate, with deterministic UUID
     passage IDs. Legacy flat rows (``id`` + ``text`` without ``candidates``) remain supported
     for tests and alternate snapshots.
+
+    Hugging Face hub I/O temporarily lowers ``httpx`` / ``httpcore`` log levels to WARNING so
+    per-chunk INFO lines do not drown real pipeline logs. Optional row ``tqdm`` uses split size
+    from dataset metadata when available (percent); otherwise shows row counts only.
+
+    This is a convenience wrapper around :func:`iter_nq_passages` for callers that still want
+    a list (tests, small capped runs).
     """
 
-    raw_split = _load_dataset(settings.dataset_name, settings.dataset_split)
+    return list(iter_nq_passages(settings))
 
-    passages: list[Passage] = []
-    for row_ordinal, row in enumerate(raw_split):
-        row_mapping = _as_mapping(row)
-        for passage in _passages_from_row(row_mapping, row_ordinal, settings):
-            passages.append(passage)
-            if settings.max_passages is not None and len(passages) >= settings.max_passages:
-                return passages
-    return passages
+
+def _ingest_progress_enabled(settings: Settings) -> bool:
+    if not settings.ingest_show_progress:
+        return False
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    return True
+
+
+def _try_split_num_examples(dataset_name: str, split: str) -> int | None:
+    """Return published row count for a split when the hub exposes it (no full data download)."""
+
+    try:
+        from datasets import load_dataset_builder
+
+        builder = load_dataset_builder(dataset_name)
+        splits = builder.info.splits
+        if splits is None or split not in splits:
+            return None
+        n = splits[split].num_examples
+        return int(n) if n is not None else None
+    except Exception:
+        return None
 
 
 def _as_mapping(row: object) -> Mapping[str, object]:
@@ -137,7 +197,10 @@ def tokenized_corpus(passages: Iterable[Passage]) -> list[list[str]]:
     return [passage.text.lower().split() for passage in passages]
 
 
-def _load_dataset(dataset_name: str, dataset_split: str) -> Iterable[object]:
+def _load_dataset(dataset_name: str, dataset_split: str, *, streaming: bool) -> Iterable[object]:
     from datasets import load_dataset
 
-    return load_dataset(dataset_name, split=dataset_split)
+    # Non-streaming ``load_dataset`` may prepare every split; NQ-retrieval's dev rows can include
+    # ``document_url`` while the hub-declared Features omit it, triggering CastError. Streaming
+    # reads only ``dataset_split`` and sidesteps that path.
+    return load_dataset(dataset_name, split=dataset_split, streaming=streaming)

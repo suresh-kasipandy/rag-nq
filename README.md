@@ -39,6 +39,8 @@ Optional environment variables use the `RAG_` prefix. See [.env.example](.env.ex
    python -m src.scripts.index_sparse
    ```
 
+   Sparse indexing writes `artifacts/sparse_checkpoint.json` after each successful sparse flush and resumes from it on the next run when silver path / collection / sparse name / BM25 params / max_passages / sparse batch size still match. Delete that checkpoint to force a full sparse rebuild.
+
 ### Migrating from `nq_passages_dense` to `nq_passages` (one-time)
 
 If you already have a **dense-only** legacy collection (for example `nq_passages_dense` with no sparse vector slot), Qdrant cannot add a new sparse name in place. Copy stored dense vectors + payloads into a new collection that includes a sparse slot (no re-embedding):
@@ -66,7 +68,7 @@ Then set `RAG_QDRANT_COLLECTION=nq_passages` (or rely on the project default), r
 **Env (see `.env.example`)**
 
 - `RAG_MAX_PASSAGES`, `RAG_FORCE_INGEST`, `RAG_EMBEDDING_BATCH_SIZE`, `RAG_DENSE_READ_BATCH_LINES`
-- Sparse / BM25 (Milestone 2.2): `RAG_QDRANT_SPARSE_VECTOR_NAME` (default `sparse`), `RAG_SPARSE_UPSERT_BATCH_SIZE`, `RAG_BM25_K1`, `RAG_BM25_B`, `RAG_BM25_EPSILON`
+- Sparse / BM25 (Milestone 2.2): `RAG_QDRANT_SPARSE_VECTOR_NAME` (default `sparse`), `RAG_SPARSE_UPSERT_BATCH_SIZE`, `RAG_SPARSE_WORKERS`, `RAG_SPARSE_WRITE_CONCURRENCY`, `RAG_SPARSE_CHECKPOINT_FILE`, `RAG_BM25_K1`, `RAG_BM25_B`, `RAG_BM25_EPSILON`
 
 `RAG_MAX_PASSAGES` now gates both:
 - ingest output size (HF → silver line count), and
@@ -78,6 +80,7 @@ Then set `RAG_QDRANT_COLLECTION=nq_passages` (or rely on the project default), r
 - `qdrant-client` is pinned near **1.13.x** to match `docker-compose` Qdrant; the client uses `check_compatibility=False` when supported.
 - Dense upsert uses a minimal retry policy (small fixed attempts + exponential backoff) for transient timeout/overload cases.
 - Dense indexing writes a minimal checkpoint at `artifacts/dense_checkpoint.json` after successful upsert chunks and resumes from it on the next run if inputs still match.
+- Sparse indexing also checkpoints progress at `artifacts/sparse_checkpoint.json`; default concurrency is conservative (`RAG_SPARSE_WORKERS=1`, `RAG_SPARSE_WRITE_CONCURRENCY=1`) so behavior stays equivalent unless you opt in to higher pass-2 concurrency.
 - **Legacy:** `src.retrieval.sparse_index.SparseIndexer` + `artifacts/bm25_index.pkl` remain for tests and historical Milestone 1–2 behavior; the default CLI path is Qdrant sparse (above).
 
 ## Milestone 1.5 — local Qdrant

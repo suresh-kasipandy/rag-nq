@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from qdrant_client import QdrantClient
@@ -15,6 +17,7 @@ from src.retrieval.sparse_qdrant import (
     _sparse_vector_for_passage,
     compute_okapi_idf,
     encode_query_sparse_vector,
+    load_sparse_pass1_artifact,
 )
 
 
@@ -129,6 +132,7 @@ def test_sparse_qdrant_end_to_end_in_memory(tmp_path: Path) -> None:
     result = indexer.build_from_jsonl(path)
     assert result.points_updated == 2
     assert settings.sparse_manifest_path.is_file()
+    assert settings.sparse_pass1_path.is_file()
 
     loaded = SparseIndexManifest.model_validate_json(
         settings.sparse_manifest_path.read_text(encoding="utf-8")
@@ -139,6 +143,15 @@ def test_sparse_qdrant_end_to_end_in_memory(tmp_path: Path) -> None:
     p1 = _pass1_scan(path, max_passages=None)
     q_i, q_v = encode_query_sparse_vector("the", term_to_id=p1.term_to_id)
     assert q_i, "fixture should yield a non-empty query sparse vector"
+
+    pass1_artifact = load_sparse_pass1_artifact(
+        path=settings.sparse_pass1_path,
+        silver_path=path,
+        max_passages=None,
+    )
+    assert pass1_artifact.document_count == 2
+    assert pass1_artifact.term_to_id == p1.term_to_id
+
     hits = client.query_points(
         collection,
         query=qm.SparseVector(indices=q_i, values=q_v),
@@ -148,3 +161,109 @@ def test_sparse_qdrant_end_to_end_in_memory(tmp_path: Path) -> None:
     assert len(hits.points) >= 1
     returned_ids = {str(p.id) for p in hits.points}
     assert pid1 in returned_ids and pid2 in returned_ids
+
+
+class FakeSparseClient:
+    def __init__(self, *, fail_when_id_seen: str | None = None) -> None:
+        self.fail_when_id_seen = fail_when_id_seen
+        self.updated_ids: list[list[str]] = []
+
+    def get_collection(self, collection_name: str) -> Any:
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                params=SimpleNamespace(sparse_vectors={"sparse": object()}),
+            )
+        )
+
+    def update_vectors(self, collection_name: str, points: Any) -> None:
+        ids = [str(p.id) for p in points]
+        self.updated_ids.append(ids)
+        if self.fail_when_id_seen is not None and self.fail_when_id_seen in ids:
+            raise RuntimeError(f"forced failure on ids={','.join(ids)}")
+
+
+def _write_sparse_fixture(path: Path, ids: list[str]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for i, pid in enumerate(ids):
+            handle.write(Passage(passage_id=pid, text=f"text {i}").model_dump_json())
+            handle.write("\n")
+
+
+def test_sparse_resume_uses_checkpoint_after_partial_failure(tmp_path: Path) -> None:
+    ids = [str(uuid.uuid4()) for _ in range(3)]
+    silver = tmp_path / "silver.jsonl"
+    _write_sparse_fixture(silver, ids)
+    settings = Settings(
+        output_dir=tmp_path / "artifacts",
+        sparse_upsert_batch_size=1,
+        qdrant_sparse_vector_name="sparse",
+        qdrant_collection="nq_passages",
+    )
+
+    first_client = FakeSparseClient(fail_when_id_seen=ids[1])
+    first_indexer = SparseQdrantIndexer(settings=settings, client=first_client)
+    with pytest.raises(RuntimeError, match="forced failure"):
+        first_indexer.build_from_jsonl(silver)
+    checkpoint_payload = settings.sparse_checkpoint_path.read_text(encoding="utf-8")
+    assert '"indexed_count": 1' in checkpoint_payload
+
+    second_client = FakeSparseClient()
+    second_indexer = SparseQdrantIndexer(settings=settings, client=second_client)
+    result = second_indexer.build_from_jsonl(silver)
+    assert result.points_updated == 2
+    assert second_client.updated_ids == [[ids[1]], [ids[2]]]
+    assert not settings.sparse_checkpoint_path.exists()
+
+
+def test_sparse_checkpoint_invalidated_when_inputs_change(tmp_path: Path) -> None:
+    ids = [str(uuid.uuid4()) for _ in range(3)]
+    silver = tmp_path / "silver.jsonl"
+    _write_sparse_fixture(silver, ids)
+    settings = Settings(
+        output_dir=tmp_path / "artifacts",
+        sparse_upsert_batch_size=1,
+        qdrant_sparse_vector_name="sparse",
+        qdrant_collection="nq_passages",
+        bm25_k1=1.5,
+    )
+    settings.sparse_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.sparse_checkpoint_path.write_text(
+        "{\n"
+        '  "schema_version": "1",\n'
+        f'  "silver_path": "{silver.resolve()}",\n'
+        '  "collection_name": "nq_passages",\n'
+        '  "sparse_vector_name": "sparse",\n'
+        '  "max_passages": null,\n'
+        '  "bm25_k1": 1.2,\n'
+        '  "bm25_b": 0.75,\n'
+        '  "bm25_epsilon": 0.25,\n'
+        '  "sparse_upsert_batch_size": 1,\n'
+        '  "indexed_count": 2\n'
+        "}\n",
+        encoding="utf-8",
+    )
+
+    client = FakeSparseClient(fail_when_id_seen=ids[0])
+    indexer = SparseQdrantIndexer(settings=settings, client=client)
+    with pytest.raises(RuntimeError, match=f"ids={ids[0]}"):
+        indexer.build_from_jsonl(silver)
+
+
+def test_sparse_concurrency_smoke_keeps_batch_size(tmp_path: Path) -> None:
+    ids = [str(uuid.uuid4()) for _ in range(4)]
+    silver = tmp_path / "silver.jsonl"
+    _write_sparse_fixture(silver, ids)
+    settings = Settings(
+        output_dir=tmp_path / "artifacts",
+        sparse_upsert_batch_size=2,
+        sparse_workers=2,
+        sparse_write_concurrency=2,
+        qdrant_sparse_vector_name="sparse",
+        qdrant_collection="nq_passages",
+    )
+    client = FakeSparseClient()
+    indexer = SparseQdrantIndexer(settings=settings, client=client)
+    result = indexer.build_from_jsonl(silver)
+    assert result.points_updated == 4
+    assert len(client.updated_ids) == 2
+    assert sorted(len(batch) for batch in client.updated_ids) == [2, 2]

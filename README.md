@@ -12,6 +12,8 @@ Lean RAG on `sentence-transformers/NQ-retrieval`: ingestion, dense/sparse indexe
 ## Configuration
 
 Optional environment variables use the `RAG_` prefix. See [.env.example](.env.example).
+Scripts load a repo-local `.env` automatically via `Settings.from_env()`; explicit shell
+environment variables still take precedence.
 
 ## Milestone 3.6 — staged indexing (raw → chunks → dense → sparse)
 

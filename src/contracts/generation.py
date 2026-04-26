@@ -1,4 +1,4 @@
-"""Generator protocol (implementation deferred to later milestones)."""
+"""Generator protocol for grounded answer generation."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from src.models.query_schemas import GroundedAnswer, PassageHit
 
 @runtime_checkable
 class Generator(Protocol):
-    """Grounded answer generation from retrieved passages."""
+    """Grounded answer generation from retrieved evidence."""
 
     def generate(self, query: str, hits: Sequence[PassageHit]) -> GroundedAnswer:
-        """Produce an answer with citations; may abstain if evidence is insufficient."""
+        """Produce an answer with point-id citations; may abstain if evidence is insufficient."""

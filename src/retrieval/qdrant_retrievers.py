@@ -340,6 +340,12 @@ def _to_hits(points: list[Any], *, score_field: str, rank_field: str) -> list[Pa
         context_text = payload.get("context_text")
         title = payload.get("title")
         document_url = payload.get("document_url")
+        group_id = payload.get("group_id")
+        chunk_kind = payload.get("chunk_kind")
+        source_row_ordinal = payload.get("source_row_ordinal")
+        start_candidate_idx = payload.get("start_candidate_idx")
+        end_candidate_idx = payload.get("end_candidate_idx")
+        passage_types = payload.get("passage_types")
         score = float(getattr(point, "score", 0.0))
         point_id = str(getattr(point, "id", ""))
         data: dict[str, Any] = {
@@ -348,6 +354,20 @@ def _to_hits(points: list[Any], *, score_field: str, rank_field: str) -> list[Pa
             "context_text": context_text if isinstance(context_text, str) else None,
             "title": title if isinstance(title, str) else None,
             "document_url": document_url if isinstance(document_url, str) else None,
+            "group_id": group_id if isinstance(group_id, str) else None,
+            "chunk_kind": chunk_kind if isinstance(chunk_kind, str) else None,
+            "source_row_ordinal": (
+                source_row_ordinal if isinstance(source_row_ordinal, int) else None
+            ),
+            "start_candidate_idx": (
+                start_candidate_idx if isinstance(start_candidate_idx, int) else None
+            ),
+            "end_candidate_idx": end_candidate_idx if isinstance(end_candidate_idx, int) else None,
+            "passage_types": (
+                [value for value in passage_types if isinstance(value, str)]
+                if isinstance(passage_types, list)
+                else []
+            ),
             score_field: score,
             rank_field: rank,
         }

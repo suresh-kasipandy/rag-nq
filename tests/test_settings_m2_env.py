@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from src.config.settings import Settings
@@ -30,6 +32,15 @@ def test_from_env_max_passages_and_embedding_batch(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("RAG_RERANK_MODEL_NAME", "cross-encoder/test")
     monkeypatch.setenv("RAG_RERANK_CONTEXT_TOKEN_BUDGET", "222")
     monkeypatch.setenv("RAG_RETRIEVAL_DEDUPE_ENABLED", "false")
+    monkeypatch.setenv("RAG_GENERATION_PROVIDER", "openai")
+    monkeypatch.setenv("RAG_GENERATION_MODEL_NAME", "generator/test")
+    monkeypatch.setenv("RAG_GENERATION_TEMPERATURE", "0.2")
+    monkeypatch.setenv("RAG_GENERATION_MAX_TOKENS", "123")
+    monkeypatch.setenv("RAG_GENERATION_TIMEOUT_SECONDS", "9.5")
+    monkeypatch.setenv("RAG_GENERATION_CONTEXT_TOKEN_BUDGET", "777")
+    monkeypatch.setenv("RAG_GENERATION_MIN_CITATIONS", "2")
+    monkeypatch.setenv("RAG_GENERATION_API_URL", "http://generator.local")
+    monkeypatch.setenv("RAG_GENERATION_API_KEY_ENV", "GEN_KEY")
     s = Settings.from_env()
     assert s.max_passages == 100
     assert s.max_raw_rows == 101
@@ -55,6 +66,15 @@ def test_from_env_max_passages_and_embedding_batch(monkeypatch: pytest.MonkeyPat
     assert s.rerank_model_name == "cross-encoder/test"
     assert s.rerank_context_token_budget == 222
     assert s.retrieval_dedupe_enabled is False
+    assert s.generation_provider == "openai"
+    assert s.generation_model_name == "generator/test"
+    assert s.generation_temperature == pytest.approx(0.2)
+    assert s.generation_max_tokens == 123
+    assert s.generation_timeout_seconds == pytest.approx(9.5)
+    assert s.generation_context_token_budget == 777
+    assert s.generation_min_citations == 2
+    assert s.generation_api_url == "http://generator.local"
+    assert s.generation_api_key_env == "GEN_KEY"
 
 
 def test_from_env_max_passages_aliases_raw_rows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -64,3 +84,28 @@ def test_from_env_max_passages_aliases_raw_rows(monkeypatch: pytest.MonkeyPatch)
 
     assert s.max_passages == 100
     assert s.max_raw_rows == 100
+
+
+def test_from_env_loads_dotenv_without_overriding_shell_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "RAG_QDRANT_COLLECTION=from_dotenv",
+                "RAG_MAX_INDEX_ROWS=123",
+                "RAG_RERANK_ENABLED=1",
+                "RAG_GENERATION_PROVIDER=heuristic",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RAG_QDRANT_COLLECTION", "from_shell")
+
+    s = Settings.from_env()
+
+    assert s.qdrant_collection == "from_shell"
+    assert s.max_index_rows == 123
+    assert s.rerank_enabled is True
+    assert s.generation_provider == "heuristic"

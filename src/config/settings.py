@@ -9,6 +9,27 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+def _load_dotenv_defaults(path: Path) -> dict[str, str]:
+    """Read simple KEY=VALUE defaults from a local .env file."""
+
+    if not path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key or key.startswith("#"):
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
 class Settings(BaseModel):
     """Application settings for Milestone 1."""
 
@@ -76,6 +97,15 @@ class Settings(BaseModel):
     rerank_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_context_token_budget: int = Field(default=384, ge=1)
     retrieval_dedupe_enabled: bool = True
+    generation_provider: Literal["heuristic", "http_json", "openai"] = "heuristic"
+    generation_model_name: str = "local-grounded-heuristic"
+    generation_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    generation_max_tokens: int = Field(default=512, ge=1)
+    generation_timeout_seconds: float = Field(default=30.0, gt=0)
+    generation_context_token_budget: int = Field(default=1_500, ge=1)
+    generation_min_citations: int = Field(default=1, ge=1)
+    generation_api_url: str | None = None
+    generation_api_key_env: str | None = None
 
     @property
     def passages_path(self) -> Path:
@@ -141,103 +171,127 @@ class Settings(BaseModel):
     def from_env(cls) -> Settings:
         """Load selected settings from `RAG_*` environment variables."""
 
+        dotenv = _load_dotenv_defaults(Path.cwd() / ".env")
+
+        def get(name: str) -> str | None:
+            return os.getenv(name) or dotenv.get(name)
+
         overrides: dict[str, object] = {}
-        if value := os.getenv("RAG_DATASET_NAME"):
+        if value := get("RAG_DATASET_NAME"):
             overrides["dataset_name"] = value
-        if value := os.getenv("RAG_DATASET_SPLIT"):
+        if value := get("RAG_DATASET_SPLIT"):
             overrides["dataset_split"] = value
-        if (value := os.getenv("RAG_DATASET_STREAMING")) is not None:
+        if (value := get("RAG_DATASET_STREAMING")) is not None:
             overrides["dataset_streaming"] = value.strip().lower() in {"1", "true", "yes", "on"}
-        if (value := os.getenv("RAG_INGEST_PROGRESS")) is not None:
+        if (value := get("RAG_INGEST_PROGRESS")) is not None:
             overrides["ingest_show_progress"] = value.strip().lower() in {"1", "true", "yes", "on"}
-        if value := os.getenv("RAG_EMBEDDING_MODEL_NAME"):
+        if value := get("RAG_EMBEDDING_MODEL_NAME"):
             overrides["embedding_model_name"] = value
-        if value := os.getenv("RAG_QDRANT_URL"):
+        if value := get("RAG_QDRANT_URL"):
             overrides["qdrant_url"] = value
-        if value := os.getenv("RAG_QDRANT_RETRIEVAL_TIMEOUT_SECONDS"):
+        if value := get("RAG_QDRANT_RETRIEVAL_TIMEOUT_SECONDS"):
             overrides["qdrant_retrieval_timeout_seconds"] = float(value)
-        if value := os.getenv("RAG_QDRANT_COLLECTION"):
+        if value := get("RAG_QDRANT_COLLECTION"):
             overrides["qdrant_collection"] = value
-        if value := os.getenv("RAG_QDRANT_SPARSE_VECTOR_NAME"):
+        if value := get("RAG_QDRANT_SPARSE_VECTOR_NAME"):
             overrides["qdrant_sparse_vector_name"] = value
-        if value := os.getenv("RAG_SPARSE_CHECKPOINT_FILE"):
+        if value := get("RAG_SPARSE_CHECKPOINT_FILE"):
             overrides["sparse_checkpoint_file"] = value
-        if value := os.getenv("RAG_SPARSE_PASS1_FILE"):
+        if value := get("RAG_SPARSE_PASS1_FILE"):
             overrides["sparse_pass1_file"] = value
-        if value := os.getenv("RAG_INDEX_CHUNKS_JSONL"):
+        if value := get("RAG_INDEX_CHUNKS_JSONL"):
             overrides["index_chunks_jsonl"] = value
-        if value := os.getenv("RAG_CHUNK_MANIFEST_FILE"):
+        if value := get("RAG_CHUNK_MANIFEST_FILE"):
             overrides["chunk_manifest_file"] = value
-        if value := os.getenv("RAG_OUTPUT_DIR"):
+        if value := get("RAG_OUTPUT_DIR"):
             overrides["output_dir"] = Path(value)
-        if value := os.getenv("RAG_MAX_PASSAGES"):
+        if value := get("RAG_MAX_PASSAGES"):
             # Deprecated alias retained for existing local scripts. New row-based
             # throttles should prefer RAG_MAX_RAW_ROWS / CHUNK_ROWS / INDEX_ROWS.
             overrides["max_passages"] = int(value)
             overrides.setdefault("max_raw_rows", int(value))
-        if value := os.getenv("RAG_MAX_RAW_ROWS"):
-            overrides["max_raw_rows"] = int(value)
-        if value := os.getenv("RAG_MAX_CHUNK_ROWS"):
+        if value := get("RAG_MAX_RAW_ROWS"):
+            if "max_raw_rows" not in overrides or os.getenv("RAG_MAX_RAW_ROWS") is not None:
+                overrides["max_raw_rows"] = int(value)
+        if value := get("RAG_MAX_CHUNK_ROWS"):
             overrides["max_chunk_rows"] = int(value)
-        if value := os.getenv("RAG_MAX_INDEX_ROWS"):
+        if value := get("RAG_MAX_INDEX_ROWS"):
             overrides["max_index_rows"] = int(value)
-        if value := os.getenv("RAG_EMBEDDING_BATCH_SIZE"):
+        if value := get("RAG_EMBEDDING_BATCH_SIZE"):
             overrides["embedding_batch_size"] = int(value)
-        if value := os.getenv("RAG_DENSE_READ_BATCH_LINES"):
+        if value := get("RAG_DENSE_READ_BATCH_LINES"):
             overrides["dense_read_batch_lines"] = int(value)
-        if value := os.getenv("RAG_SPARSE_UPSERT_BATCH_SIZE"):
+        if value := get("RAG_SPARSE_UPSERT_BATCH_SIZE"):
             overrides["sparse_upsert_batch_size"] = int(value)
-        if value := os.getenv("RAG_SPARSE_WORKERS"):
+        if value := get("RAG_SPARSE_WORKERS"):
             overrides["sparse_workers"] = int(value)
-        if value := os.getenv("RAG_SPARSE_WRITE_CONCURRENCY"):
+        if value := get("RAG_SPARSE_WRITE_CONCURRENCY"):
             overrides["sparse_write_concurrency"] = int(value)
-        if value := os.getenv("RAG_BM25_K1"):
+        if value := get("RAG_BM25_K1"):
             overrides["bm25_k1"] = float(value)
-        if value := os.getenv("RAG_BM25_B"):
+        if value := get("RAG_BM25_B"):
             overrides["bm25_b"] = float(value)
-        if value := os.getenv("RAG_BM25_EPSILON"):
+        if value := get("RAG_BM25_EPSILON"):
             overrides["bm25_epsilon"] = float(value)
-        if value := os.getenv("RAG_SPARSE_ANALYZER"):
+        if value := get("RAG_SPARSE_ANALYZER"):
             overrides["sparse_analyzer"] = value
-        if value := os.getenv("RAG_CHUNK_MIN_TOKENS_SOFT"):
+        if value := get("RAG_CHUNK_MIN_TOKENS_SOFT"):
             overrides["chunk_min_tokens_soft"] = int(value)
-        if value := os.getenv("RAG_CHUNK_MIN_TOKENS_HARD"):
+        if value := get("RAG_CHUNK_MIN_TOKENS_HARD"):
             overrides["chunk_min_tokens_hard"] = int(value)
-        if value := os.getenv("RAG_CHUNK_TARGET_TOKENS"):
+        if value := get("RAG_CHUNK_TARGET_TOKENS"):
             overrides["chunk_target_tokens"] = int(value)
-        if value := os.getenv("RAG_CHUNK_MAX_TOKENS"):
+        if value := get("RAG_CHUNK_MAX_TOKENS"):
             overrides["chunk_max_tokens"] = int(value)
-        if value := os.getenv("RAG_CHUNK_CONTEXT_TEXT_TOKEN_CAP"):
+        if value := get("RAG_CHUNK_CONTEXT_TEXT_TOKEN_CAP"):
             overrides["chunk_context_text_token_cap"] = int(value)
-        if value := os.getenv("RAG_PROGRESS_LOG_EVERY_RECORDS"):
+        if value := get("RAG_PROGRESS_LOG_EVERY_RECORDS"):
             overrides["progress_log_every_records"] = int(value)
-        if value := os.getenv("RAG_PROGRESS_LOG_EVERY_BATCHES"):
+        if value := get("RAG_PROGRESS_LOG_EVERY_BATCHES"):
             overrides["progress_log_every_batches"] = int(value)
-        if value := os.getenv("RAG_PROGRESS_LOG_EVERY_SECONDS"):
+        if value := get("RAG_PROGRESS_LOG_EVERY_SECONDS"):
             overrides["progress_log_every_seconds"] = float(value)
-        if value := os.getenv("RAG_HYBRID_RRF_K"):
+        if value := get("RAG_HYBRID_RRF_K"):
             overrides["hybrid_rrf_k"] = int(value)
-        if value := os.getenv("RAG_HYBRID_DENSE_WEIGHT"):
+        if value := get("RAG_HYBRID_DENSE_WEIGHT"):
             overrides["hybrid_dense_weight"] = float(value)
-        if value := os.getenv("RAG_HYBRID_SPARSE_WEIGHT"):
+        if value := get("RAG_HYBRID_SPARSE_WEIGHT"):
             overrides["hybrid_sparse_weight"] = float(value)
-        if value := os.getenv("RAG_RETRIEVE_K"):
+        if value := get("RAG_RETRIEVE_K"):
             overrides["retrieve_k"] = int(value)
-        if value := os.getenv("RAG_RERANK_K"):
+        if value := get("RAG_RERANK_K"):
             overrides["rerank_k"] = int(value)
-        if (value := os.getenv("RAG_RERANK_ENABLED")) is not None:
+        if (value := get("RAG_RERANK_ENABLED")) is not None:
             overrides["rerank_enabled"] = value.strip().lower() in {"1", "true", "yes", "on"}
-        if value := os.getenv("RAG_RERANK_MODEL_NAME"):
+        if value := get("RAG_RERANK_MODEL_NAME"):
             overrides["rerank_model_name"] = value
-        if value := os.getenv("RAG_RERANK_CONTEXT_TOKEN_BUDGET"):
+        if value := get("RAG_RERANK_CONTEXT_TOKEN_BUDGET"):
             overrides["rerank_context_token_budget"] = int(value)
-        if (value := os.getenv("RAG_RETRIEVAL_DEDUPE_ENABLED")) is not None:
+        if (value := get("RAG_RETRIEVAL_DEDUPE_ENABLED")) is not None:
             overrides["retrieval_dedupe_enabled"] = value.strip().lower() in {
                 "1",
                 "true",
                 "yes",
                 "on",
             }
+        if value := get("RAG_GENERATION_PROVIDER"):
+            overrides["generation_provider"] = value
+        if value := get("RAG_GENERATION_MODEL_NAME"):
+            overrides["generation_model_name"] = value
+        if value := get("RAG_GENERATION_TEMPERATURE"):
+            overrides["generation_temperature"] = float(value)
+        if value := get("RAG_GENERATION_MAX_TOKENS"):
+            overrides["generation_max_tokens"] = int(value)
+        if value := get("RAG_GENERATION_TIMEOUT_SECONDS"):
+            overrides["generation_timeout_seconds"] = float(value)
+        if value := get("RAG_GENERATION_CONTEXT_TOKEN_BUDGET"):
+            overrides["generation_context_token_budget"] = int(value)
+        if value := get("RAG_GENERATION_MIN_CITATIONS"):
+            overrides["generation_min_citations"] = int(value)
+        if value := get("RAG_GENERATION_API_URL"):
+            overrides["generation_api_url"] = value
+        if value := get("RAG_GENERATION_API_KEY_ENV"):
+            overrides["generation_api_key_env"] = value
         return cls(**overrides)
 
     @staticmethod

@@ -38,13 +38,16 @@ def test_query_request_bounds() -> None:
 
 
 def test_grounded_answer_citation_ids() -> None:
+    evidence = PassageHit(point_id="a", text="Evidence text")
     ga = GroundedAnswer(
         answer="Based on sources.",
-        citations=[Citation(passage_id="a"), Citation(passage_id="b")],
+        citations=[Citation(point_id="a"), Citation(point_id="b")],
         abstained=False,
-        supporting_passage_ids=["a", "b"],
+        supporting_point_ids=["a", "b"],
+        supporting_evidence=[evidence],
     )
     assert len(ga.citations) == 2
+    assert ga.supporting_evidence[0].point_id == "a"
 
 
 def test_query_response_optional_sections() -> None:

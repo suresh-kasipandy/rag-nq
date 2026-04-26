@@ -73,6 +73,9 @@ def test_prompt_builder_includes_ids_metadata_and_bounded_context() -> None:
     assert "Chunk kind: table_span" in prompt.text
     assert "Passage types: table" in prompt.text
     assert "Content: one two three" in prompt.text
+    assert "You are not a general-knowledge assistant" in prompt.text
+    assert "The sentence must be supported" in prompt.text
+    assert "supported_claims must contain objects" in prompt.text
     assert "four" not in prompt.text
 
 
@@ -95,6 +98,12 @@ def test_grounded_generator_returns_valid_point_id_citations_and_supporting_evid
             "answer": "The release date was 9 May 2012.",
             "citations": ["p1", {"point_id": "missing"}],
             "abstained": False,
+            "supported_claims": [
+                {"claim": "The release date was 9 May 2012.", "point_ids": ["p1", "missing"]}
+            ],
+            "unsupported_claims": [
+                {"claim": "It was released worldwide.", "reason": "The evidence does not say this."}
+            ],
         }
     )
     hit = PassageHit(point_id="p1", text="Xbox 360WW: 9 May 2012", title="Minecraft")
@@ -110,6 +119,9 @@ def test_grounded_generator_returns_valid_point_id_citations_and_supporting_evid
     assert answer.abstained is False
     assert answer.answer == "The release date was 9 May 2012."
     assert [citation.point_id for citation in answer.citations] == ["p1"]
+    assert len(answer.supported_claims) == 1
+    assert answer.supported_claims[0].point_ids == ["p1"]
+    assert len(answer.unsupported_claims) == 1
     assert answer.supporting_point_ids == ["p1"]
     assert answer.supporting_evidence[0].point_id == "p1"
     assert client.last_temperature == pytest.approx(0.1)
@@ -137,6 +149,60 @@ def test_grounded_generator_abstains_when_citations_are_invalid() -> None:
 
     assert answer.abstained is True
     assert answer.citations == []
+
+
+def test_grounded_generator_preserves_abstention_reason_and_unsupported_claims() -> None:
+    client = FakeLLMClient(
+        {
+            "answer": "",
+            "citations": [],
+            "abstained": True,
+            "supported_claims": [],
+            "unsupported_claims": [
+                {
+                    "claim": "Both are orphans raised by relatives.",
+                    "reason": "Only Luke's relatives are stated in the retrieved evidence.",
+                }
+            ],
+            "abstention_reason": "Retrieved evidence does not support the comparison.",
+        }
+    )
+    generator = GroundedGenerator(settings=Settings(), client=client)
+
+    answer = generator.generate("q", [PassageHit(point_id="p1", text="Luke evidence")])
+
+    assert answer.abstained is True
+    assert answer.abstention_reason == "Retrieved evidence does not support the comparison."
+    assert len(answer.unsupported_claims) == 1
+    assert "orphans" in answer.unsupported_claims[0].claim
+
+
+def test_supported_claims_must_use_answer_level_citations() -> None:
+    client = FakeLLMClient(
+        {
+            "answer": "Only the first claim is cited.",
+            "citations": ["p1"],
+            "abstained": False,
+            "supported_claims": [
+                {"claim": "Supported by canonical citation.", "point_ids": ["p1"]},
+                {"claim": "Supported only by uncited evidence.", "point_ids": ["p2"]},
+            ],
+        }
+    )
+    generator = GroundedGenerator(settings=Settings(), client=client)
+
+    answer = generator.generate(
+        "q",
+        [
+            PassageHit(point_id="p1", text="cited evidence"),
+            PassageHit(point_id="p2", text="retrieved but uncited evidence"),
+        ],
+    )
+
+    assert answer.abstained is False
+    assert [claim.claim for claim in answer.supported_claims] == [
+        "Supported by canonical citation."
+    ]
 
 
 def test_grounded_generator_rejects_citation_to_unrendered_evidence() -> None:
@@ -220,6 +286,15 @@ def test_openai_client_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None
 
     with pytest.raises(RuntimeError, match="OPENAI_API_KEY is required"):
         client.complete("prompt", temperature=0.0, max_tokens=1, timeout_seconds=1.0)
+
+
+def test_openai_client_rejects_api_key_as_env_var_name() -> None:
+    client = OpenAILLMClient(model_name="gpt-test", api_key_env="sk-test-secret")
+
+    with pytest.raises(RuntimeError, match="must be an environment variable name") as exc_info:
+        client.complete("prompt", temperature=0.0, max_tokens=1, timeout_seconds=1.0)
+
+    assert "sk-test-secret" not in str(exc_info.value)
 
 
 def test_build_default_llm_client_supports_openai_provider() -> None:

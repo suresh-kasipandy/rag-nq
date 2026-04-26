@@ -47,3 +47,6 @@ artifacts/
 
 # Logs
 *.log
+
+# Notebooks
+*.ipynb

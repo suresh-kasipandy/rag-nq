@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,11 @@ import pytest
 from src.config.settings import Settings
 
 
-def test_from_env_max_passages_and_embedding_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_from_env_max_passages_and_embedding_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("RAG_MAX_RAW_ROWS", raising=False)
     monkeypatch.setenv("RAG_MAX_PASSAGES", "100")
     monkeypatch.setenv("RAG_MAX_RAW_ROWS", "101")
     monkeypatch.setenv("RAG_MAX_CHUNK_ROWS", "102")
@@ -77,7 +82,11 @@ def test_from_env_max_passages_and_embedding_batch(monkeypatch: pytest.MonkeyPat
     assert s.generation_api_key_env == "GEN_KEY"
 
 
-def test_from_env_max_passages_aliases_raw_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_from_env_max_passages_aliases_raw_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("RAG_MAX_RAW_ROWS", raising=False)
     monkeypatch.setenv("RAG_MAX_PASSAGES", "100")
 
     s = Settings.from_env()
@@ -90,6 +99,11 @@ def test_from_env_loads_dotenv_without_overriding_shell_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("RAG_MAX_INDEX_ROWS", raising=False)
+    monkeypatch.delenv("RAG_RERANK_ENABLED", raising=False)
+    monkeypatch.delenv("RAG_GENERATION_PROVIDER", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "from_shell_secret")
+    monkeypatch.delenv("LOCAL_PROXY_KEY", raising=False)
     (tmp_path / ".env").write_text(
         "\n".join(
             [
@@ -97,6 +111,8 @@ def test_from_env_loads_dotenv_without_overriding_shell_env(
                 "RAG_MAX_INDEX_ROWS=123",
                 "RAG_RERANK_ENABLED=1",
                 "RAG_GENERATION_PROVIDER=heuristic",
+                "OPENAI_API_KEY=from_dotenv_secret",
+                "LOCAL_PROXY_KEY=from_dotenv_proxy_secret",
             ]
         ),
         encoding="utf-8",
@@ -109,3 +125,5 @@ def test_from_env_loads_dotenv_without_overriding_shell_env(
     assert s.max_index_rows == 123
     assert s.rerank_enabled is True
     assert s.generation_provider == "heuristic"
+    assert os.getenv("OPENAI_API_KEY") == "from_shell_secret"
+    assert os.getenv("LOCAL_PROXY_KEY") == "from_dotenv_proxy_secret"

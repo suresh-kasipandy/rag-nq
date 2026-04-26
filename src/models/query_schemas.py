@@ -15,6 +15,20 @@ class Citation(BaseModel):
     point_id: str = Field(min_length=1)
 
 
+class SupportedClaim(BaseModel):
+    """A generated answer claim and the retrieved point IDs that directly support it."""
+
+    claim: str = Field(min_length=1)
+    point_ids: list[str] = Field(min_length=1)
+
+
+class UnsupportedClaim(BaseModel):
+    """A requested or considered claim that could not be grounded in retrieved evidence."""
+
+    claim: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class DuplicateAlias(BaseModel):
     """Collapsed duplicate hit retained for retrieval debugging/provenance."""
 
@@ -89,6 +103,9 @@ class GroundedAnswer(BaseModel):
     answer: str = ""
     citations: list[Citation] = Field(default_factory=list)
     abstained: bool = False
+    supported_claims: list[SupportedClaim] = Field(default_factory=list)
+    unsupported_claims: list[UnsupportedClaim] = Field(default_factory=list)
+    abstention_reason: str | None = None
     supporting_point_ids: list[str] = Field(default_factory=list)
     supporting_evidence: list[PassageHit] = Field(default_factory=list)
 

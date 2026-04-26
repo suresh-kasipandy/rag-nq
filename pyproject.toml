@@ -12,6 +12,7 @@ dependencies = [
     "qdrant-client>=1.13.0,<1.14",
     "rank-bm25>=0.2.2",
     "sentence-transformers>=3.0.0",
+    "python-dotenv>=1.2.2",
 ]
 
 [dependency-groups]

@@ -12,7 +12,13 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from src.config.settings import Settings
-from src.models.query_schemas import Citation, GroundedAnswer, PassageHit
+from src.models.query_schemas import (
+    Citation,
+    GroundedAnswer,
+    PassageHit,
+    SupportedClaim,
+    UnsupportedClaim,
+)
 
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 _POINT_ID_RE = re.compile(r"point_id=([^\]\s]+)")
@@ -64,10 +70,25 @@ class GroundedPromptBuilder:
             blocks.append(_format_evidence_block(len(rendered_evidence), hit, body))
         prompt = "\n\n".join(
             [
-                "You are a grounded QA system. Answer only from the retrieved evidence.",
-                "If the evidence is insufficient, return JSON with abstained=true.",
-                "Return only JSON with keys: answer, citations, abstained.",
+                "Grounding contract:",
+                "You are not a general-knowledge assistant. You are an evidence-bound answer composer.",
+                "Before writing the answer, decompose the requested answer into the minimum facts "
+                "needed to answer it. Only include facts that are directly supported by the "
+                "retrieved evidence.",
+                "For every sentence in the answer:",
+                "- The sentence must be supported by one or more retrieved point_ids.",
+                "- The cited point_ids must support the specific sentence, not just the broad topic.",
+                "- Do not transfer a fact from one entity, event, time, work, or category to another.",
+                "- Do not fill missing links with outside knowledge.",
+                "- Do not use plausible world knowledge unless it appears in the retrieved evidence.",
+                "If the evidence supports only a narrower answer than the user asked for, answer "
+                "narrowly and state the limitation.",
+                "If the evidence does not support a useful answer, return abstained=true.",
+                "Return only JSON with keys: abstained, answer, citations, supported_claims, "
+                "unsupported_claims, abstention_reason.",
                 "citations must be point_id values from the provided evidence.",
+                "supported_claims must contain objects with keys: claim, point_ids.",
+                "unsupported_claims must contain objects with keys: claim, reason.",
                 f"Question: {query}",
                 "\n\n".join(blocks) if blocks else "No evidence provided.",
             ]
@@ -125,11 +146,17 @@ class HeuristicGroundedClient:
         if point_match is None or content_match is None:
             return json.dumps({"answer": "", "citations": [], "abstained": True})
         sentence = _first_sentence(content_match.group(1).strip())
+        point_id = point_match.group(1)
         return json.dumps(
             {
                 "answer": sentence,
-                "citations": [point_match.group(1)],
+                "citations": [point_id],
                 "abstained": not bool(sentence),
+                "supported_claims": (
+                    [{"claim": sentence, "point_ids": [point_id]}] if sentence else []
+                ),
+                "unsupported_claims": [],
+                "abstention_reason": None if sentence else "No supported evidence sentence found.",
             }
         )
 
@@ -204,6 +231,11 @@ class OpenAILLMClient:
         max_tokens: int,
         timeout_seconds: float,
     ) -> str:
+        if _looks_like_openai_api_key(self.api_key_env):
+            raise RuntimeError(
+                "RAG_GENERATION_API_KEY_ENV must be an environment variable name "
+                "such as OPENAI_API_KEY, not the API key value."
+            )
         api_key = os.getenv(self.api_key_env)
         if not api_key:
             raise RuntimeError(f"{self.api_key_env} is required for OpenAI generation.")
@@ -215,7 +247,8 @@ class OpenAILLMClient:
                         "role": "system",
                         "content": (
                             "You are a grounded QA system. Return only valid JSON with "
-                            "keys: answer, citations, abstained."
+                            "keys: abstained, answer, citations, supported_claims, "
+                            "unsupported_claims, abstention_reason."
                         ),
                     },
                     {"role": "user", "content": prompt},
@@ -273,8 +306,13 @@ def _grounded_answer_from_response(
     raw: str, *, evidence: Sequence[PassageHit], min_citations: int
 ) -> GroundedAnswer:
     payload = _parse_response_json(raw)
-    if payload is None or payload.get("abstained") is True:
+    if payload is None:
         return _abstain()
+    if payload.get("abstained") is True:
+        return _abstain(
+            reason=_optional_string(payload.get("abstention_reason")),
+            unsupported_claims=_extract_unsupported_claims(payload.get("unsupported_claims")),
+        )
     answer = payload.get("answer")
     if not isinstance(answer, str) or not answer.strip():
         return _abstain()
@@ -283,11 +321,18 @@ def _grounded_answer_from_response(
     valid_ids = [point_id for point_id in cited_ids if point_id in valid_by_id]
     if len(valid_ids) < min_citations:
         return _abstain()
+    supported_claims = _extract_supported_claims(
+        payload.get("supported_claims"), valid_point_ids=set(valid_ids)
+    )
+    unsupported_claims = _extract_unsupported_claims(payload.get("unsupported_claims"))
     supporting = [valid_by_id[point_id].model_copy(deep=True) for point_id in valid_ids]
     return GroundedAnswer(
         answer=answer.strip(),
         citations=[Citation(point_id=point_id) for point_id in valid_ids],
         abstained=False,
+        supported_claims=supported_claims,
+        unsupported_claims=unsupported_claims,
+        abstention_reason=None,
         supporting_point_ids=valid_ids,
         supporting_evidence=supporting,
     )
@@ -324,6 +369,10 @@ def _openai_chat_content(payload: object) -> str | None:
     return content if isinstance(content, str) else None
 
 
+def _looks_like_openai_api_key(value: str) -> bool:
+    return value.startswith(("sk-", "sk_proj_", "sk-proj-"))
+
+
 def _extract_cited_point_ids(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
@@ -338,6 +387,56 @@ def _extract_cited_point_ids(raw: object) -> list[str]:
         if point_id and point_id not in out:
             out.append(point_id)
     return out
+
+
+def _extract_supported_claims(raw: object, *, valid_point_ids: set[str]) -> list[SupportedClaim]:
+    if not isinstance(raw, list):
+        return []
+    out: list[SupportedClaim] = []
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get("claim"), str):
+            continue
+        point_ids = _extract_point_id_list(item.get("point_ids"))
+        valid_ids = [point_id for point_id in point_ids if point_id in valid_point_ids]
+        if not valid_ids:
+            continue
+        out.append(SupportedClaim(claim=item["claim"].strip(), point_ids=valid_ids))
+    return out
+
+
+def _extract_unsupported_claims(raw: object) -> list[UnsupportedClaim]:
+    if not isinstance(raw, list):
+        return []
+    out: list[UnsupportedClaim] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        claim = item.get("claim")
+        reason = item.get("reason")
+        if not isinstance(claim, str) or not isinstance(reason, str):
+            continue
+        claim = claim.strip()
+        reason = reason.strip()
+        if claim and reason:
+            out.append(UnsupportedClaim(claim=claim, reason=reason))
+    return out
+
+
+def _extract_point_id_list(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for value in raw:
+        if isinstance(value, str) and value and value not in out:
+            out.append(value)
+    return out
+
+
+def _optional_string(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    return value or None
 
 
 def _evidence_text(hit: PassageHit) -> str:
@@ -364,5 +463,13 @@ def _first_sentence(text: str) -> str:
     return (match.group(1) if match else text).strip()
 
 
-def _abstain() -> GroundedAnswer:
-    return GroundedAnswer(answer="", citations=[], abstained=True)
+def _abstain(
+    *, reason: str | None = None, unsupported_claims: list[UnsupportedClaim] | None = None
+) -> GroundedAnswer:
+    return GroundedAnswer(
+        answer="",
+        citations=[],
+        abstained=True,
+        unsupported_claims=unsupported_claims or [],
+        abstention_reason=reason,
+    )

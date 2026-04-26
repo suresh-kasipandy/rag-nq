@@ -13,6 +13,8 @@ from src.models.query_schemas import (
     QueryResponse,
     RetrievalMetrics,
     RetrievalStageTimings,
+    SupportedClaim,
+    UnsupportedClaim,
 )
 
 
@@ -43,11 +45,20 @@ def test_grounded_answer_citation_ids() -> None:
         answer="Based on sources.",
         citations=[Citation(point_id="a"), Citation(point_id="b")],
         abstained=False,
+        supported_claims=[SupportedClaim(claim="A is supported.", point_ids=["a"])],
+        unsupported_claims=[UnsupportedClaim(claim="C is unsupported.", reason="No evidence.")],
         supporting_point_ids=["a", "b"],
         supporting_evidence=[evidence],
     )
     assert len(ga.citations) == 2
+    assert ga.supported_claims[0].point_ids == ["a"]
+    assert ga.unsupported_claims[0].reason == "No evidence."
     assert ga.supporting_evidence[0].point_id == "a"
+
+
+def test_supported_claim_requires_point_ids() -> None:
+    with pytest.raises(ValidationError):
+        SupportedClaim(claim="Unsupported shape.", point_ids=[])
 
 
 def test_query_response_optional_sections() -> None:

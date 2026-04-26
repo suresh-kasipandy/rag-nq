@@ -6,28 +6,8 @@ import os
 from pathlib import Path
 from typing import Literal
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-
-
-def _load_dotenv_defaults(path: Path) -> dict[str, str]:
-    """Read simple KEY=VALUE defaults from a local .env file."""
-
-    if not path.is_file():
-        return {}
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, raw_value = line.split("=", 1)
-        key = key.strip()
-        if not key or key.startswith("#"):
-            continue
-        value = raw_value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        values[key] = value
-    return values
 
 
 class Settings(BaseModel):
@@ -171,10 +151,11 @@ class Settings(BaseModel):
     def from_env(cls) -> Settings:
         """Load selected settings from `RAG_*` environment variables."""
 
-        dotenv = _load_dotenv_defaults(Path.cwd() / ".env")
+        env_before_dotenv = set(os.environ)
+        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
 
         def get(name: str) -> str | None:
-            return os.getenv(name) or dotenv.get(name)
+            return os.getenv(name)
 
         overrides: dict[str, object] = {}
         if value := get("RAG_DATASET_NAME"):
@@ -211,7 +192,7 @@ class Settings(BaseModel):
             overrides["max_passages"] = int(value)
             overrides.setdefault("max_raw_rows", int(value))
         if value := get("RAG_MAX_RAW_ROWS"):
-            if "max_raw_rows" not in overrides or os.getenv("RAG_MAX_RAW_ROWS") is not None:
+            if "max_raw_rows" not in overrides or "RAG_MAX_RAW_ROWS" in env_before_dotenv:
                 overrides["max_raw_rows"] = int(value)
         if value := get("RAG_MAX_CHUNK_ROWS"):
             overrides["max_chunk_rows"] = int(value)

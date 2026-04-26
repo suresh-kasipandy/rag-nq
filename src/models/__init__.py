@@ -12,6 +12,8 @@ from src.models.query_schemas import (
     QueryResponse,
     RetrievalMetrics,
     RetrievalStageTimings,
+    SupportedClaim,
+    UnsupportedClaim,
 )
 
 __all__ = [
@@ -24,5 +26,7 @@ __all__ = [
     "QueryResponse",
     "RetrievalMetrics",
     "RetrievalStageTimings",
+    "SupportedClaim",
+    "UnsupportedClaim",
 ]
 

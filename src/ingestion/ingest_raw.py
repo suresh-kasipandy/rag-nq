@@ -43,7 +43,7 @@ def raw_inputs_match_manifest(settings: Settings, manifest: RawDatasetManifest) 
         manifest.schema_version == RAW_DATASET_SCHEMA_VERSION
         and manifest.dataset_name == settings.dataset_name
         and manifest.dataset_split == settings.dataset_split
-        and manifest.max_passages == settings.max_passages
+        and manifest.max_raw_rows == settings.max_raw_rows
     )
 
 
@@ -98,7 +98,7 @@ def run_raw_ingest(settings: Settings, *, force: bool = False) -> tuple[RawDatas
         logger=LOGGER,
         stage="ingest_raw",
         label="rows",
-        total=settings.max_passages,
+        total=settings.max_raw_rows,
         every_items=settings.progress_log_every_records,
         every_seconds=settings.progress_log_every_seconds,
     )
@@ -107,7 +107,7 @@ def run_raw_ingest(settings: Settings, *, force: bool = False) -> tuple[RawDatas
         split=settings.dataset_split,
         output=settings.raw_dataset_path,
         streaming=settings.dataset_streaming,
-        max_passages=settings.max_passages,
+        max_raw_rows=settings.max_raw_rows,
     )
     row_count = 0
     with tmp_raw.open("w", encoding="utf-8") as handle:
@@ -116,7 +116,7 @@ def run_raw_ingest(settings: Settings, *, force: bool = False) -> tuple[RawDatas
             handle.write("\n")
             row_count += 1
             ticker.tick(row_count, output=settings.raw_dataset_path)
-            if settings.max_passages is not None and row_count >= settings.max_passages:
+            if settings.max_raw_rows is not None and row_count >= settings.max_raw_rows:
                 break
         handle.flush()
         os.fsync(handle.fileno())
@@ -128,6 +128,7 @@ def run_raw_ingest(settings: Settings, *, force: bool = False) -> tuple[RawDatas
         dataset_name=settings.dataset_name,
         dataset_split=settings.dataset_split,
         max_passages=settings.max_passages,
+        max_raw_rows=settings.max_raw_rows,
         row_count=row_count,
         created_at_utc=datetime.now(UTC).replace(microsecond=0).isoformat(),
     )

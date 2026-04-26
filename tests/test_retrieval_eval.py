@@ -126,11 +126,11 @@ def test_run_retrieval_eval_writes_deterministic_report(
 
         def retrieve(self, query: str, top_k: int) -> list[PassageHit]:
             if self.mode == "dense":
-                return [PassageHit(passage_id="p1", text="Paris is the capital of France.")]
+                return [PassageHit(point_id="p1", text="Paris is the capital of France.")]
             if self.mode == "sparse":
-                return [PassageHit(passage_id="p2", text="Madrid is in Spain.")]
+                return [PassageHit(point_id="p2", text="Madrid is in Spain.")]
             if self.mode == "hybrid":
-                return [PassageHit(passage_id="p1", text="Paris is the capital of France.")]
+                return [PassageHit(point_id="p1", text="Paris is the capital of France.")]
             raise AssertionError("unexpected mode")
 
     monkeypatch.setattr(

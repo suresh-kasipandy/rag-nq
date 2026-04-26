@@ -8,6 +8,7 @@ import pytest
 from src.config.settings import Settings
 from src.ingestion.chunk_raw import (
     annotate_row_candidates,
+    iter_index_chunk_groups_from_raw_artifact,
     iter_index_chunks_from_raw_artifact,
     run_chunk_ingest,
 )
@@ -30,6 +31,7 @@ def _write_raw_fixture(settings: Settings, rows: list[dict[str, object]]) -> Non
         dataset_name=settings.dataset_name,
         dataset_split=settings.dataset_split,
         max_passages=settings.max_passages,
+        max_raw_rows=settings.max_raw_rows,
         row_count=len(rows),
         created_at_utc="2026-01-01T00:00:00+00:00",
     )
@@ -89,6 +91,12 @@ def test_iter_index_chunks_merges_small_compatible_candidates(tmp_path) -> None:
     assert chunks[0].chunk_kind == "minimum_context_span"
     assert chunks[0].passage_types == ["paragraph", "paragraph"]
 
+    groups = list(iter_index_chunk_groups_from_raw_artifact(settings))
+    assert len(groups) == 1
+    assert groups[0].question == "Which planet is smallest?"
+    assert len(groups[0].chunks) == 1
+    assert groups[0].chunks[0].chunk_id == chunks[0].chunk_id
+
 
 def test_context_text_expands_structurally_dependent_chunk(tmp_path) -> None:
     settings = Settings(
@@ -127,6 +135,40 @@ def test_context_text_expands_structurally_dependent_chunk(tmp_path) -> None:
     assert chunks[1].context_text.endswith(chunks[1].text)
 
 
+def test_iter_index_chunk_groups_respects_max_chunk_rows(tmp_path) -> None:
+    settings = Settings(
+        output_dir=tmp_path,
+        max_chunk_rows=2,
+        chunk_min_tokens_soft=12,
+        chunk_min_tokens_hard=5,
+        chunk_max_tokens=80,
+    )
+    _write_raw_fixture(
+        settings,
+        [
+            {
+                "title": "One",
+                "candidates": ["Mercury is the smallest planet in the Solar System."],
+                "passage_types": ["paragraph"],
+            },
+            {
+                "title": "Two",
+                "candidates": ["Venus is the second planet from the Sun."],
+                "passage_types": ["paragraph"],
+            },
+            {
+                "title": "Three",
+                "candidates": ["Earth is the third planet from the Sun."],
+                "passage_types": ["paragraph"],
+            },
+        ],
+    )
+
+    groups = list(iter_index_chunk_groups_from_raw_artifact(settings))
+
+    assert [group.title for group in groups] == ["One", "Two"]
+
+
 def test_run_chunk_ingest_writes_manifest_and_skips_when_fresh(
     tmp_path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -158,6 +200,8 @@ def test_run_chunk_ingest_writes_manifest_and_skips_when_fresh(
     assert not skipped
     assert second_skipped
     assert second_manifest.line_count == manifest.line_count == 1
+    assert second_manifest.chunk_count == manifest.chunk_count == 1
+    assert manifest.max_chunk_rows is None
     assert manifest.schema_version == CHUNK_MANIFEST_SCHEMA_VERSION
     assert manifest.chunk_schema_version == INDEX_CHUNK_SCHEMA_VERSION
     assert settings.index_chunks_path.is_file()
@@ -166,3 +210,12 @@ def test_run_chunk_ingest_writes_manifest_and_skips_when_fresh(
     assert any("[chunk] start rows=0/1" in message for message in messages)
     assert any("[chunk] progress rows=1/1" in message for message in messages)
     assert any("[chunk] complete rows=1/1" in message for message in messages)
+    payload = json.loads(settings.index_chunks_path.read_text(encoding="utf-8"))
+    assert payload["group_id"]
+    assert payload["texts"]
+    assert len(payload["chunks"]) == 1
+    assert "question" not in payload["chunks"][0]
+    assert "text" not in payload["chunks"][0]
+    assert "context_text" not in payload["chunks"][0]
+    assert payload["chunks"][0]["text_idxs"] == [0, 1]
+    assert payload["chunks"][0]["context_idxs"] == [0, 1]

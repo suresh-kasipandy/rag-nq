@@ -9,7 +9,7 @@ from src.models.query_schemas import GroundedAnswer, PassageHit
 class _DummyRetriever:
     def retrieve(self, query: str, top_k: int) -> list[PassageHit]:
         return [
-            PassageHit(passage_id="1", text="t", source=None),
+            PassageHit(point_id="1", text="t"),
         ]
 
 
@@ -33,4 +33,4 @@ def test_dummy_retriever_contract() -> None:
     r: Retriever = _DummyRetriever()
     out = r.retrieve("q", top_k=3)
     assert len(out) == 1
-    assert out[0].passage_id == "1"
+    assert out[0].point_id == "1"

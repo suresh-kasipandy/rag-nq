@@ -21,6 +21,9 @@ class Settings(BaseModel):
     dataset_streaming: bool = True
     ingest_show_progress: bool = True
     max_passages: int | None = Field(default=None, ge=1)
+    max_raw_rows: int | None = Field(default=None, ge=1)
+    max_chunk_rows: int | None = Field(default=None, ge=1)
+    max_index_rows: int | None = Field(default=None, ge=1)
 
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_batch_size: int = Field(default=64, ge=1)
@@ -67,6 +70,12 @@ class Settings(BaseModel):
     hybrid_rrf_k: int = Field(default=60, ge=1)
     hybrid_dense_weight: float = Field(default=1.0, ge=0)
     hybrid_sparse_weight: float = Field(default=1.0, ge=0)
+    retrieve_k: int = Field(default=50, ge=1)
+    rerank_k: int | None = Field(default=None, ge=1)
+    rerank_enabled: bool = False
+    rerank_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_context_token_budget: int = Field(default=384, ge=1)
+    retrieval_dedupe_enabled: bool = True
 
     @property
     def passages_path(self) -> Path:
@@ -162,7 +171,16 @@ class Settings(BaseModel):
         if value := os.getenv("RAG_OUTPUT_DIR"):
             overrides["output_dir"] = Path(value)
         if value := os.getenv("RAG_MAX_PASSAGES"):
+            # Deprecated alias retained for existing local scripts. New row-based
+            # throttles should prefer RAG_MAX_RAW_ROWS / CHUNK_ROWS / INDEX_ROWS.
             overrides["max_passages"] = int(value)
+            overrides.setdefault("max_raw_rows", int(value))
+        if value := os.getenv("RAG_MAX_RAW_ROWS"):
+            overrides["max_raw_rows"] = int(value)
+        if value := os.getenv("RAG_MAX_CHUNK_ROWS"):
+            overrides["max_chunk_rows"] = int(value)
+        if value := os.getenv("RAG_MAX_INDEX_ROWS"):
+            overrides["max_index_rows"] = int(value)
         if value := os.getenv("RAG_EMBEDDING_BATCH_SIZE"):
             overrides["embedding_batch_size"] = int(value)
         if value := os.getenv("RAG_DENSE_READ_BATCH_LINES"):
@@ -203,6 +221,23 @@ class Settings(BaseModel):
             overrides["hybrid_dense_weight"] = float(value)
         if value := os.getenv("RAG_HYBRID_SPARSE_WEIGHT"):
             overrides["hybrid_sparse_weight"] = float(value)
+        if value := os.getenv("RAG_RETRIEVE_K"):
+            overrides["retrieve_k"] = int(value)
+        if value := os.getenv("RAG_RERANK_K"):
+            overrides["rerank_k"] = int(value)
+        if (value := os.getenv("RAG_RERANK_ENABLED")) is not None:
+            overrides["rerank_enabled"] = value.strip().lower() in {"1", "true", "yes", "on"}
+        if value := os.getenv("RAG_RERANK_MODEL_NAME"):
+            overrides["rerank_model_name"] = value
+        if value := os.getenv("RAG_RERANK_CONTEXT_TOKEN_BUDGET"):
+            overrides["rerank_context_token_budget"] = int(value)
+        if (value := os.getenv("RAG_RETRIEVAL_DEDUPE_ENABLED")) is not None:
+            overrides["retrieval_dedupe_enabled"] = value.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
         return cls(**overrides)
 
     @staticmethod

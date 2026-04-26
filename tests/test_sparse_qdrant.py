@@ -14,7 +14,9 @@ from qdrant_client.http import models as qm
 from src.config.settings import Settings
 from src.ingestion.models import (
     SPARSE_INDEX_MANIFEST_VERSION,
-    IndexChunk,
+    IndexChunkGroup,
+    IndexChunkItem,
+    IndexText,
     Passage,
     SparseIndexManifest,
 )
@@ -197,6 +199,13 @@ class FakeSparseClient:
             raise RuntimeError(f"forced failure on ids={','.join(ids)}")
 
 
+class HttpNoiseSparseClient(FakeSparseClient):
+    def update_vectors(self, collection_name: str, points: Any) -> None:
+        logging.getLogger("httpx").info("httpx-info-sparse")
+        logging.getLogger("httpx").warning("httpx-warning-sparse")
+        super().update_vectors(collection_name, points)
+
+
 def _write_sparse_fixture(path: Path, ids: list[str]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for i, pid in enumerate(ids):
@@ -207,17 +216,35 @@ def _write_sparse_fixture(path: Path, ids: list[str]) -> None:
 def test_sparse_indexer_uses_chunk_id_for_index_chunks(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    chunk = IndexChunk(
-        chunk_id=str(uuid.uuid4()),
+    chunk_id = str(uuid.uuid4())
+    group = IndexChunkGroup(
         group_id="group-1",
-        text="Mercury is the smallest planet.",
-        context_text="Mercury is the smallest planet in the Solar System.",
         source_row_ordinal=0,
-        start_candidate_idx=1,
-        end_candidate_idx=1,
+        question="Which planet is smallest?",
+        texts=[
+            IndexText(
+                text_idx=0,
+                raw_idx=1,
+                text="Mercury is the smallest planet.",
+            ),
+            IndexText(
+                text_idx=1,
+                raw_idx=None,
+                text="Mercury is the smallest planet in the Solar System.",
+            ),
+        ],
+        chunks=[
+            IndexChunkItem(
+                chunk_id=chunk_id,
+                text_idxs=[0],
+                context_idxs=[1],
+                start_candidate_idx=1,
+                end_candidate_idx=1,
+            )
+        ],
     )
     chunks = tmp_path / "index_chunks.jsonl"
-    chunks.write_text(chunk.model_dump_json() + "\n", encoding="utf-8")
+    chunks.write_text(group.model_dump_json() + "\n", encoding="utf-8")
     settings = Settings(
         output_dir=tmp_path / "artifacts",
         sparse_upsert_batch_size=1,
@@ -233,7 +260,7 @@ def test_sparse_indexer_uses_chunk_id_for_index_chunks(
     result = indexer.build_from_jsonl(chunks)
 
     assert result.points_updated == 1
-    assert client.updated_ids == [[chunk.chunk_id]]
+    assert client.updated_ids == [[chunk_id]]
     progress_records = [
         (getattr(record, "stage", None), record.getMessage()) for record in caplog.records
     ]
@@ -249,6 +276,57 @@ def test_sparse_indexer_uses_chunk_id_for_index_chunks(
         stage == "sparse_pass2" and message.startswith("progress batches=1/1")
         for stage, message in progress_records
     )
+
+
+def test_sparse_pass1_respects_max_index_rows_for_groups(tmp_path: Path) -> None:
+    group1 = IndexChunkGroup(
+        group_id="group-1",
+        source_row_ordinal=0,
+        texts=[
+            IndexText(text_idx=0, raw_idx=0, text="alpha beta"),
+            IndexText(text_idx=1, raw_idx=1, text="gamma delta"),
+        ],
+        chunks=[
+            IndexChunkItem(
+                chunk_id="chunk-1",
+                text_idxs=[0],
+                context_idxs=[0],
+                start_candidate_idx=0,
+                end_candidate_idx=0,
+            ),
+            IndexChunkItem(
+                chunk_id="chunk-2",
+                text_idxs=[1],
+                context_idxs=[1],
+                start_candidate_idx=1,
+                end_candidate_idx=1,
+            ),
+        ],
+    )
+    group2 = IndexChunkGroup(
+        group_id="group-2",
+        source_row_ordinal=1,
+        texts=[IndexText(text_idx=0, raw_idx=0, text="epsilon zeta")],
+        chunks=[
+            IndexChunkItem(
+                chunk_id="chunk-3",
+                text_idxs=[0],
+                context_idxs=[0],
+                start_candidate_idx=0,
+                end_candidate_idx=0,
+            )
+        ],
+    )
+    chunks = tmp_path / "index_chunks.jsonl"
+    chunks.write_text(
+        f"{group1.model_dump_json()}\n{group2.model_dump_json()}\n",
+        encoding="utf-8",
+    )
+
+    p1 = _pass1_scan(chunks, max_index_rows=1, analyzer="whitespace")
+
+    assert p1.document_count == 2
+    assert p1.term_to_id == {"alpha": 0, "beta": 1, "gamma": 2, "delta": 3}
 
 
 def test_sparse_resume_uses_checkpoint_after_partial_failure(tmp_path: Path) -> None:
@@ -329,6 +407,52 @@ def test_sparse_concurrency_smoke_keeps_batch_size(tmp_path: Path) -> None:
     assert result.points_updated == 4
     assert len(client.updated_ids) == 2
     assert sorted(len(batch) for batch in client.updated_ids) == [2, 2]
+
+
+def test_sparse_indexer_quiets_httpx_info_keeps_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ids = [str(uuid.uuid4())]
+    silver = tmp_path / "silver_http_noise.jsonl"
+    _write_sparse_fixture(silver, ids)
+    settings = Settings(
+        output_dir=tmp_path / "artifacts",
+        sparse_upsert_batch_size=1,
+        qdrant_sparse_vector_name="sparse",
+        qdrant_collection="nq_passages",
+    )
+    caplog.set_level(logging.INFO)
+    client = HttpNoiseSparseClient()
+    indexer = SparseQdrantIndexer(settings=settings, client=client)
+    result = indexer.build_from_jsonl(silver)
+
+    assert result.points_updated == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert "httpx-warning-sparse" in messages
+    assert "httpx-info-sparse" not in messages
+
+
+def test_sparse_indexer_restores_httpx_logger_level(tmp_path: Path) -> None:
+    ids = [str(uuid.uuid4())]
+    silver = tmp_path / "silver_http_logger_restore.jsonl"
+    _write_sparse_fixture(silver, ids)
+    settings = Settings(
+        output_dir=tmp_path / "artifacts",
+        sparse_upsert_batch_size=1,
+        qdrant_sparse_vector_name="sparse",
+        qdrant_collection="nq_passages",
+    )
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        client = HttpNoiseSparseClient()
+        indexer = SparseQdrantIndexer(settings=settings, client=client)
+        result = indexer.build_from_jsonl(silver)
+        assert result.points_updated == 1
+        assert logger.level == logging.INFO
+    finally:
+        logger.setLevel(previous_level)
 
 
 def test_sparse_build_reuses_existing_pass1_artifact(tmp_path: Path, monkeypatch) -> None:

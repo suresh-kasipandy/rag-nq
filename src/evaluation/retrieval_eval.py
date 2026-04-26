@@ -194,7 +194,7 @@ def evaluate_mode(
 
     for case in cases:
         hits = retriever.retrieve(case.query, top_k=top_k)
-        retrieved_ids = [hit.passage_id for hit in hits]
+        retrieved_ids = [hit.point_id for hit in hits]
         relevant = set(case.relevant_passage_ids)
         recalls.append(compute_recall_at_k(retrieved_ids, relevant, k=top_k))
         mrrs.append(compute_mrr_at_k(retrieved_ids, relevant, k=top_k))

@@ -86,14 +86,14 @@ def test_should_skip_ingest_when_manifest_matches(
 def test_should_skip_raw_ingest_when_manifest_matches(tmp_path: Path) -> None:
     out = tmp_path / "out"
     out.mkdir()
-    settings = Settings(output_dir=out, dataset_name="ds", dataset_split="train", max_passages=2)
+    settings = Settings(output_dir=out, dataset_name="ds", dataset_split="train", max_raw_rows=2)
     settings.raw_dataset_path.write_text('{"id":"1"}\n{"id":"2"}\n', encoding="utf-8")
     settings.raw_manifest_path.write_text(
         RawDatasetManifest(
             schema_version=RAW_DATASET_SCHEMA_VERSION,
             dataset_name="ds",
             dataset_split="train",
-            max_passages=2,
+            max_raw_rows=2,
             row_count=2,
             created_at_utc="2020-01-01T00:00:00+00:00",
         ).model_dump_json(),
@@ -134,6 +134,33 @@ def test_run_raw_ingest_writes_artifacts(
     assert any("[ingest_raw] start rows=0 " in message for message in messages)
     assert any("[ingest_raw] progress rows=1 " in message for message in messages)
     assert any("[ingest_raw] complete rows=2 " in message for message in messages)
+
+
+def test_run_raw_ingest_respects_max_raw_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    settings = Settings(
+        output_dir=out,
+        dataset_name="ds",
+        dataset_split="train",
+        max_raw_rows=2,
+    )
+
+    def fake_rows(_settings: Settings):
+        yield {"id": "x", "candidates": ["A"]}
+        yield {"id": "y", "candidates": ["B"]}
+        yield {"id": "z", "candidates": ["C"]}
+
+    monkeypatch.setattr("src.ingestion.nq_loader._iter_hf_rows", fake_rows)
+    manifest, skipped = run_raw_ingest(settings, force=True)
+
+    assert skipped is False
+    assert manifest.row_count == 2
+    assert manifest.max_raw_rows == 2
+    assert count_jsonl_lines(settings.raw_dataset_path) == 2
 
 
 def test_run_ingest_streams_from_raw_artifact(

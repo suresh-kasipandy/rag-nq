@@ -17,7 +17,7 @@ Optional environment variables use the `RAG_` prefix. See [.env.example](.env.ex
 
 **Goal:** Hugging Face is only used during **raw ingest**; downstream stages read local artifacts. Ingest now keeps:
 - `artifacts/raw_dataset.jsonl` + `artifacts/raw_ingest_manifest.json` (raw row snapshot)
-- `artifacts/index_chunks.jsonl` + `artifacts/chunk_manifest.json` (chunked index corpus)
+- `artifacts/index_chunks.jsonl` + `artifacts/chunk_manifest.json` (grouped chunked index corpus)
 
 When manifests match current settings, ingest reuses local artifacts and avoids network.
 
@@ -132,7 +132,7 @@ Then set `RAG_QDRANT_COLLECTION=nq_passages` (or rely on the project default), r
 
 To stop Qdrant without deleting stored vectors: `docker compose stop`. To remove the volume as well: `docker compose down -v`.
 
-Chunk ingestion follows the HuggingFace `sentence-transformers/NQ-retrieval` layout: each row’s `candidates` list is preprocessed, role-tagged, merged into structure-aware chunks, and emitted with deterministic `chunk_id` values plus metadata (`title`, `question`, `passage_types`, `document_url`, `long_answers`, and bounded `context_text`).
+Chunk ingestion follows the HuggingFace `sentence-transformers/NQ-retrieval` layout: each row’s `candidates` list is preprocessed, role-tagged, and merged into structure-aware chunks. `index_chunks.jsonl` stores one JSON object per source row/group with shared metadata (`title`, `question`, `document_url`, `long_answers`), a local `texts` pool, and a nested `chunks` list that references `texts` by `text_idxs` and `context_idxs`. Dense and sparse indexers flatten those references into Qdrant points using deterministic `chunk_id` values.
 
 ## Commands
 

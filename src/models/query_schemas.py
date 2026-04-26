@@ -15,14 +15,51 @@ class Citation(BaseModel):
     passage_id: str = Field(min_length=1)
 
 
+class DuplicateAlias(BaseModel):
+    """Collapsed duplicate hit retained for retrieval debugging/provenance."""
+
+    point_id: str = Field(min_length=1)
+    dense_score: float | None = None
+    dense_rank: int | None = Field(default=None, ge=1)
+    sparse_score: float | None = None
+    sparse_rank: int | None = Field(default=None, ge=1)
+    fusion_rank: int | None = Field(default=None, ge=1)
+    rerank_score: float | None = None
+    rerank_rank: int | None = Field(default=None, ge=1)
+
+
+class DedupeMetrics(BaseModel):
+    """Per-query retrieval dedupe counters."""
+
+    raw_count: int = Field(ge=0)
+    unique_count: int = Field(ge=0)
+    dedupe_drop_count: int = Field(ge=0)
+    dedupe_drop_rate: float = Field(ge=0.0, le=1.0)
+
+
+class RetrievalStageTimings(BaseModel):
+    """Per-query retrieval latency breakdown in seconds."""
+
+    retrieve_seconds: float = Field(ge=0.0)
+    fusion_seconds: float = Field(default=0.0, ge=0.0)
+    rerank_seconds: float = Field(default=0.0, ge=0.0)
+    dedupe_seconds: float = Field(default=0.0, ge=0.0)
+    total_seconds: float = Field(ge=0.0)
+
+
+class RetrievalMetrics(BaseModel):
+    """Optional debug metrics for retrieval-only responses."""
+
+    dedupe: DedupeMetrics | None = None
+    timings: RetrievalStageTimings | None = None
+
+
 class PassageHit(BaseModel):
     """A retrieved passage with optional per-retriever scores and ranks."""
 
-    passage_id: str = Field(min_length=1)
-    chunk_id: str | None = Field(default=None, min_length=1)
+    point_id: str = Field(min_length=1)
     text: str = Field(min_length=1)
     context_text: str | None = None
-    source: str | None = None
     title: str | None = None
     document_url: str | None = None
     dense_score: float | None = None
@@ -30,6 +67,10 @@ class PassageHit(BaseModel):
     sparse_score: float | None = None
     sparse_rank: int | None = Field(default=None, ge=1)
     fusion_rank: int | None = Field(default=None, ge=1)
+    rerank_score: float | None = None
+    rerank_rank: int | None = Field(default=None, ge=1)
+    dedupe_rank: int | None = Field(default=None, ge=1)
+    duplicate_aliases: list[DuplicateAlias] = Field(default_factory=list)
 
 
 class GroundedAnswer(BaseModel):
@@ -57,4 +98,5 @@ class QueryResponse(BaseModel):
 
     query: str
     retrieved_passages: list[PassageHit] | None = None
+    retrieval_metrics: RetrievalMetrics | None = None
     grounded: GroundedAnswer | None = None

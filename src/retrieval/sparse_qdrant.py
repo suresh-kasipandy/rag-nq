@@ -18,12 +18,14 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from src.config.settings import Settings
+from src.ingestion.chunk_store import iter_index_records_jsonl
 from src.ingestion.models import (
     SPARSE_INDEX_MANIFEST_VERSION,
     IndexChunk,
     Passage,
     SparseIndexManifest,
 )
+from src.observability.logging_setup import quiet_http_clients
 from src.observability.progress import ProgressTicker
 from src.retrieval.sparse_index import (
     SPARSE_ANALYZER_VERSION,
@@ -75,6 +77,7 @@ class SparsePass1Data:
     term_to_id: dict[str, int]
     silver_path_resolved: str
     max_passages: int | None
+    max_index_rows: int | None = None
     sparse_analyzer: SparseAnalyzerName = "regex_stem_stop"
     sparse_analyzer_version: str = SPARSE_ANALYZER_VERSION
 
@@ -91,15 +94,6 @@ class _PendingWrite:
     point_count: int
 
 
-def _record_from_json(line: str) -> IndexChunk | Passage:
-    payload = json.loads(line)
-    if not isinstance(payload, dict):
-        raise ValueError("JSONL line must decode to an object.")
-    if "chunk_id" in payload:
-        return IndexChunk.model_validate(payload)
-    return Passage.model_validate(payload)
-
-
 def _record_id(record: IndexChunk | Passage) -> str:
     return record.chunk_id if isinstance(record, IndexChunk) else record.passage_id
 
@@ -107,7 +101,8 @@ def _record_id(record: IndexChunk | Passage) -> str:
 def _pass1_scan(
     jsonl_path: Path,
     *,
-    max_passages: int | None,
+    max_index_rows: int | None = None,
+    max_passages: int | None = None,
     analyzer: SparseAnalyzerName = "regex_stem_stop",
     ticker: ProgressTicker | None = None,
 ) -> _Pass1State:
@@ -118,23 +113,24 @@ def _pass1_scan(
     doc_count = 0
     total_tokens = 0
 
-    with jsonl_path.open("r", encoding="utf-8") as handle:
-        for raw in handle:
-            if max_passages is not None and doc_count >= max_passages:
-                break
-            line = raw.strip()
-            if not line:
+    for passage in iter_index_records_jsonl(
+        jsonl_path,
+        max_records=max_passages,
+        max_rows=max_index_rows,
+    ):
+        tokens = _tokenize_passage_text(passage.text, analyzer=analyzer)
+        doc_count += 1
+        total_tokens += len(tokens)
+        seen_terms: set[str] = set()
+        for term in tokens:
+            if term in seen_terms:
                 continue
-            passage = _record_from_json(line)
-            tokens = _tokenize_passage_text(passage.text, analyzer=analyzer)
-            doc_count += 1
-            total_tokens += len(tokens)
-            for term in set(tokens):
-                if term not in term_to_id:
-                    term_to_id[term] = len(term_to_id)
-                nd[term] = nd.get(term, 0) + 1
-            if ticker is not None:
-                ticker.tick(doc_count, total_tokens=total_tokens, vocabulary_size=len(term_to_id))
+            seen_terms.add(term)
+            if term not in term_to_id:
+                term_to_id[term] = len(term_to_id)
+            nd[term] = nd.get(term, 0) + 1
+        if ticker is not None:
+            ticker.tick(doc_count, total_tokens=total_tokens, vocabulary_size=len(term_to_id))
 
     return _Pass1State(
         document_count=doc_count,
@@ -147,7 +143,8 @@ def _pass1_scan(
 def _scan_document_frequencies(
     jsonl_path: Path,
     *,
-    max_passages: int | None,
+    max_index_rows: int | None = None,
+    max_passages: int | None = None,
     analyzer: SparseAnalyzerName = "regex_stem_stop",
     ticker: ProgressTicker | None = None,
 ) -> tuple[int, int, dict[str, int]]:
@@ -156,21 +153,18 @@ def _scan_document_frequencies(
     nd: dict[str, int] = {}
     doc_count = 0
     total_tokens = 0
-    with jsonl_path.open("r", encoding="utf-8") as handle:
-        for raw in handle:
-            if max_passages is not None and doc_count >= max_passages:
-                break
-            line = raw.strip()
-            if not line:
-                continue
-            passage = _record_from_json(line)
-            tokens = _tokenize_passage_text(passage.text, analyzer=analyzer)
-            doc_count += 1
-            total_tokens += len(tokens)
-            for term in set(tokens):
-                nd[term] = nd.get(term, 0) + 1
-            if ticker is not None:
-                ticker.tick(doc_count, total_tokens=total_tokens, vocabulary_size=len(nd))
+    for passage in iter_index_records_jsonl(
+        jsonl_path,
+        max_records=max_passages,
+        max_rows=max_index_rows,
+    ):
+        tokens = _tokenize_passage_text(passage.text, analyzer=analyzer)
+        doc_count += 1
+        total_tokens += len(tokens)
+        for term in set(tokens):
+            nd[term] = nd.get(term, 0) + 1
+        if ticker is not None:
+            ticker.tick(doc_count, total_tokens=total_tokens, vocabulary_size=len(nd))
     return doc_count, total_tokens, nd
 
 
@@ -277,6 +271,7 @@ def load_sparse_pass1_artifact(
     *,
     path: Path,
     silver_path: Path | None = None,
+    max_index_rows: int | None = None,
     max_passages: int | None = None,
     sparse_analyzer: SparseAnalyzerName = "regex_stem_stop",
 ) -> SparsePass1Data:
@@ -309,6 +304,11 @@ def load_sparse_pass1_artifact(
         raise RuntimeError(
             "Sparse pass-1 artifact max_passages does not match current settings. "
             "Rebuild sparse index (or align RAG_MAX_PASSAGES)."
+        )
+    if payload.get("max_index_rows") != max_index_rows:
+        raise RuntimeError(
+            "Sparse pass-1 artifact max_index_rows does not match current settings. "
+            "Rebuild sparse index (or align RAG_MAX_INDEX_ROWS)."
         )
     if payload.get("sparse_analyzer", "whitespace") != sparse_analyzer:
         raise RuntimeError(
@@ -343,6 +343,7 @@ def load_sparse_pass1_artifact(
         term_to_id=term_to_id,
         silver_path_resolved=payload.get("silver_path", ""),
         max_passages=payload.get("max_passages"),
+        max_index_rows=payload.get("max_index_rows"),
         sparse_analyzer=payload.get("sparse_analyzer", sparse_analyzer),
         sparse_analyzer_version=payload.get("sparse_analyzer_version", SPARSE_ANALYZER_VERSION),
     )
@@ -402,6 +403,7 @@ def _load_sparse_checkpoint(
     silver_path: Path,
     collection_name: str,
     sparse_vector_name: str,
+    max_index_rows: int | None,
     max_passages: int | None,
     bm25_k1: float,
     bm25_b: float,
@@ -422,6 +424,7 @@ def _load_sparse_checkpoint(
         "silver_path": str(silver_path.resolve()),
         "collection_name": collection_name,
         "sparse_vector_name": sparse_vector_name,
+        "max_index_rows": max_index_rows,
         "max_passages": max_passages,
         "bm25_k1": bm25_k1,
         "bm25_b": bm25_b,
@@ -445,6 +448,7 @@ def _write_sparse_checkpoint(
     silver_path: Path,
     collection_name: str,
     sparse_vector_name: str,
+    max_index_rows: int | None,
     max_passages: int | None,
     bm25_k1: float,
     bm25_b: float,
@@ -460,6 +464,7 @@ def _write_sparse_checkpoint(
         "silver_path": str(silver_path.resolve()),
         "collection_name": collection_name,
         "sparse_vector_name": sparse_vector_name,
+        "max_index_rows": max_index_rows,
         "max_passages": max_passages,
         "bm25_k1": bm25_k1,
         "bm25_b": bm25_b,
@@ -489,6 +494,7 @@ def _write_sparse_pass1_artifact(
     *,
     path: Path,
     silver_path: Path,
+    max_index_rows: int | None,
     max_passages: int | None,
     sparse_analyzer: SparseAnalyzerName,
     pass1: _Pass1State,
@@ -500,6 +506,7 @@ def _write_sparse_pass1_artifact(
     payload = {
         "schema_version": _SPARSE_PASS1_ARTIFACT_SCHEMA_VERSION,
         "silver_path": str(silver_path.resolve()),
+        "max_index_rows": max_index_rows,
         "max_passages": max_passages,
         "document_count": pass1.document_count,
         "total_tokens": pass1.total_tokens,
@@ -546,16 +553,19 @@ class SparseQdrantIndexer:
         self,
         jsonl_path: Path,
         *,
+        max_index_rows: int | None = None,
         max_passages: int | None = None,
     ) -> SparseQdrantBuildResult:
         """Two-pass streaming sparse attach: global stats, then batched ``update_vectors``."""
 
-        self.assert_collection_sparse_ready()
+        with quiet_http_clients():
+            self.assert_collection_sparse_ready()
         p1: _Pass1State
         try:
             pass1_data = load_sparse_pass1_artifact(
                 path=self._settings.sparse_pass1_path,
                 silver_path=jsonl_path,
+                max_index_rows=max_index_rows,
                 max_passages=max_passages,
                 sparse_analyzer=self._settings.sparse_analyzer,
             )
@@ -575,6 +585,7 @@ class SparseQdrantIndexer:
             )
             p1 = _pass1_scan(
                 jsonl_path,
+                max_index_rows=max_index_rows,
                 max_passages=max_passages,
                 analyzer=self._settings.sparse_analyzer,
                 ticker=pass1_ticker,
@@ -587,6 +598,7 @@ class SparseQdrantIndexer:
             _write_sparse_pass1_artifact(
                 path=self._settings.sparse_pass1_path,
                 silver_path=jsonl_path,
+                max_index_rows=max_index_rows,
                 max_passages=max_passages,
                 sparse_analyzer=self._settings.sparse_analyzer,
                 pass1=p1,
@@ -612,6 +624,7 @@ class SparseQdrantIndexer:
             )
             doc_count, total_tokens, nd = _scan_document_frequencies(
                 jsonl_path,
+                max_index_rows=max_index_rows,
                 max_passages=max_passages,
                 analyzer=self._settings.sparse_analyzer,
                 ticker=pass1_ticker,
@@ -645,7 +658,13 @@ class SparseQdrantIndexer:
                 vocabulary_size=0,
                 points_updated=0,
             )
-            self.write_manifest(jsonl_path=jsonl_path, pass1=p1, idf={}, result=result)
+            self.write_manifest(
+                jsonl_path=jsonl_path,
+                max_index_rows=max_index_rows,
+                pass1=p1,
+                idf={},
+                result=result,
+            )
             return result
 
         idf = compute_okapi_idf(
@@ -659,6 +678,7 @@ class SparseQdrantIndexer:
             silver_path=jsonl_path,
             collection_name=self._settings.qdrant_collection,
             sparse_vector_name=self._settings.qdrant_sparse_vector_name,
+            max_index_rows=max_index_rows,
             max_passages=max_passages,
             bm25_k1=self._settings.bm25_k1,
             bm25_b=self._settings.bm25_b,
@@ -737,6 +757,7 @@ class SparseQdrantIndexer:
                 silver_path=jsonl_path,
                 collection_name=self._settings.qdrant_collection,
                 sparse_vector_name=self._settings.qdrant_sparse_vector_name,
+                max_index_rows=max_index_rows,
                 max_passages=max_passages,
                 bm25_k1=self._settings.bm25_k1,
                 bm25_b=self._settings.bm25_b,
@@ -784,24 +805,23 @@ class SparseQdrantIndexer:
             if len(pending_writes) >= self._settings.sparse_write_concurrency:
                 _wait_one_pending()
 
-        with (
-            ThreadPoolExecutor(max_workers=self._settings.sparse_workers) as compute_executor,
-            ThreadPoolExecutor(
-                max_workers=self._settings.sparse_write_concurrency
-            ) as writer_executor,
-        ):
-            passages_batch: list[IndexChunk | Passage] = []
-            with jsonl_path.open("r", encoding="utf-8") as handle:
-                for raw in handle:
-                    if max_passages is not None and seen_non_empty >= max_passages:
-                        break
-                    line = raw.strip()
-                    if not line:
-                        continue
+        with quiet_http_clients():
+            with (
+                ThreadPoolExecutor(max_workers=self._settings.sparse_workers) as compute_executor,
+                ThreadPoolExecutor(
+                    max_workers=self._settings.sparse_write_concurrency
+                ) as writer_executor,
+            ):
+                passages_batch: list[IndexChunk | Passage] = []
+                for record in iter_index_records_jsonl(
+                    jsonl_path,
+                    max_records=max_passages,
+                    max_rows=max_index_rows,
+                ):
                     seen_non_empty += 1
                     if seen_non_empty <= checkpoint.indexed_count:
                         continue
-                    passages_batch.append(_record_from_json(line))
+                    passages_batch.append(record)
                     if len(passages_batch) >= self._settings.sparse_upsert_batch_size:
                         _submit_batch(
                             passages_batch,
@@ -814,8 +834,8 @@ class SparseQdrantIndexer:
                     compute_executor=compute_executor,
                     writer_executor=writer_executor,
                 )
-            while pending_writes:
-                _wait_one_pending()
+                while pending_writes:
+                    _wait_one_pending()
 
         _remove_sparse_checkpoint(checkpoint_path)
 
@@ -824,7 +844,13 @@ class SparseQdrantIndexer:
             vocabulary_size=len(p1.term_to_id),
             points_updated=points_updated,
         )
-        self.write_manifest(jsonl_path=jsonl_path, pass1=p1, idf=idf, result=result)
+        self.write_manifest(
+            jsonl_path=jsonl_path,
+            max_index_rows=max_index_rows,
+            pass1=p1,
+            idf=idf,
+            result=result,
+        )
         pass2_ticker.finish(
             batches_completed,
             records_indexed=completed_non_empty,
@@ -840,6 +866,7 @@ class SparseQdrantIndexer:
         self,
         *,
         jsonl_path: Path,
+        max_index_rows: int | None,
         pass1: _Pass1State,
         idf: dict[str, float],
         result: SparseQdrantBuildResult,
@@ -859,6 +886,7 @@ class SparseQdrantIndexer:
             sparse_upsert_batch_size=self._settings.sparse_upsert_batch_size,
             sparse_analyzer=self._settings.sparse_analyzer,
             sparse_analyzer_version=SPARSE_ANALYZER_VERSION,
+            max_index_rows=max_index_rows,
             document_count=result.document_count,
             vocabulary_size=result.vocabulary_size,
             points_updated=result.points_updated,

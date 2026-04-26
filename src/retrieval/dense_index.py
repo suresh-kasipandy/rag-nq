@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from src.config.settings import Settings
+from src.ingestion.chunk_store import count_index_records_jsonl, iter_index_records_jsonl
 from src.ingestion.models import IndexChunk, Passage
-from src.observability.progress import ProgressTicker, count_non_empty_jsonl
+from src.observability.logging_setup import quiet_http_clients
+from src.observability.progress import ProgressTicker
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,7 +63,6 @@ def _qdrant_payload(record: IndexChunk | Passage) -> dict[str, object]:
     payload: dict[str, object] = {"text": record.text}
     for name in (
         "context_text",
-        "source",
         "title",
         "question",
         "document_url",
@@ -74,7 +75,6 @@ def _qdrant_payload(record: IndexChunk | Passage) -> dict[str, object]:
     if isinstance(record, IndexChunk):
         payload.update(
             {
-                "chunk_id": record.chunk_id,
                 "source_row_ordinal": record.source_row_ordinal,
                 "start_candidate_idx": record.start_candidate_idx,
                 "end_candidate_idx": record.end_candidate_idx,
@@ -96,13 +96,13 @@ def _record_id(record: IndexChunk | Passage) -> str:
     return record.chunk_id if isinstance(record, IndexChunk) else record.passage_id
 
 
-def _record_from_json(line: str) -> IndexChunk | Passage:
-    payload = json.loads(line)
-    if not isinstance(payload, dict):
-        raise ValueError("JSONL line must decode to an object.")
-    if "chunk_id" in payload:
-        return IndexChunk.model_validate(payload)
-    return Passage.model_validate(payload)
+def _dense_embedding_text(record: IndexChunk | Passage) -> str:
+    """Compose dense embedding input while keeping payload text unchanged."""
+
+    title = getattr(record, "title", None)
+    if isinstance(title, str) and title.strip():
+        return f"{record.text}\nTitle: {title.strip()}"
+    return record.text
 
 
 class DenseIndexer:
@@ -121,22 +121,23 @@ class DenseIndexer:
     def build(self, passages: list[Passage]) -> DenseBuildResult:
         """Create or reuse collection and upsert all passage vectors."""
 
-        self._ensure_collection(vector_size=self._embedding_dimension())
-        texts = [passage.text for passage in passages]
-        vectors = self._model.encode(
-            texts,
-            batch_size=self._settings.embedding_batch_size,
-            normalize_embeddings=True,
-        )
-        points = [
-            {
-                "id": passage.passage_id,
-                "vector": {self._settings.qdrant_vector_name: list(vector)},
-                "payload": _qdrant_payload(passage),
-            }
-            for passage, vector in zip(passages, vectors, strict=True)
-        ]
-        self._client.upsert(collection_name=self._settings.qdrant_collection, points=points)
+        with quiet_http_clients():
+            self._ensure_collection(vector_size=self._embedding_dimension())
+            texts = [_dense_embedding_text(passage) for passage in passages]
+            vectors = self._model.encode(
+                texts,
+                batch_size=self._settings.embedding_batch_size,
+                normalize_embeddings=True,
+            )
+            points = [
+                {
+                    "id": passage.passage_id,
+                    "vector": {self._settings.qdrant_vector_name: list(vector)},
+                    "payload": _qdrant_payload(passage),
+                }
+                for passage, vector in zip(passages, vectors, strict=True)
+            ]
+            self._client.upsert(collection_name=self._settings.qdrant_collection, points=points)
 
         vector_size = len(points[0]["vector"][self._settings.qdrant_vector_name]) if points else 0
         return DenseBuildResult(vector_count=len(points), vector_size=vector_size)
@@ -146,118 +147,126 @@ class DenseIndexer:
         jsonl_path: Path,
         *,
         lines_per_batch: int,
+        max_index_rows: int | None = None,
         max_passages: int | None = None,
     ) -> DenseBuildResult:
         """Encode and upsert passages by reading silver JSONL in bounded line batches.
 
-        When ``max_passages`` is set, only the first N non-empty silver lines are indexed.
+        When ``max_index_rows`` is set, only the first N non-empty JSONL rows are indexed
+        before grouped chunk rows are flattened. ``max_passages`` remains a flattened-record
+        compatibility/debug cap.
         """
 
-        self._ensure_collection(vector_size=self._embedding_dimension())
-        checkpoint_path = self._settings.dense_checkpoint_path
-        resume_count = _load_dense_checkpoint(
-            path=checkpoint_path,
-            silver_path=jsonl_path,
-            collection_name=self._settings.qdrant_collection,
-            vector_name=self._settings.qdrant_vector_name,
-            max_passages=max_passages,
-        )
-        if resume_count:
-            LOGGER.info("resuming dense from checkpoint at %s passages", resume_count)
-        total_records = count_non_empty_jsonl(jsonl_path, max_records=max_passages)
-        remaining_records = max(total_records - resume_count, 0)
-        total_batches = math.ceil(remaining_records / lines_per_batch) if remaining_records else 0
-        ticker = ProgressTicker(
-            logger=LOGGER,
-            stage="dense_index",
-            label="batches",
-            total=total_batches,
-            every_items=self._settings.progress_log_every_batches,
-            every_seconds=self._settings.progress_log_every_seconds,
-        )
-        ticker.start(
-            input=jsonl_path,
-            collection=self._settings.qdrant_collection,
-            vector_name=self._settings.qdrant_vector_name,
-            records_total=total_records,
-            read_batch_lines=lines_per_batch,
-            embedding_batch_size=self._settings.embedding_batch_size,
-            checkpoint=checkpoint_path,
-        )
-        vector_size = 0
-        total_vectors = resume_count
-        batches_completed = 0
-        batch: list[IndexChunk | Passage] = []
-        consumed_non_empty_lines = 0
-
-        def flush() -> None:
-            nonlocal batches_completed, vector_size, total_vectors, batch
-            if not batch:
-                return
-            texts = [p.text for p in batch]
-            vectors = self._model.encode(
-                texts,
-                batch_size=self._settings.embedding_batch_size,
-                normalize_embeddings=True,
-            )
-            points = [
-                {
-                    "id": _record_id(passage),
-                    "vector": {self._settings.qdrant_vector_name: list(vector)},
-                    "payload": _qdrant_payload(passage),
-                }
-                for passage, vector in zip(batch, vectors, strict=True)
-            ]
-            _upsert_with_retry(
-                client=self._client,
-                collection_name=self._settings.qdrant_collection,
-                points=points,
-            )
-            total_vectors += len(points)
-            _write_dense_checkpoint(
+        with quiet_http_clients():
+            self._ensure_collection(vector_size=self._embedding_dimension())
+            checkpoint_path = self._settings.dense_checkpoint_path
+            resume_count = _load_dense_checkpoint(
                 path=checkpoint_path,
                 silver_path=jsonl_path,
                 collection_name=self._settings.qdrant_collection,
                 vector_name=self._settings.qdrant_vector_name,
+                max_index_rows=max_index_rows,
                 max_passages=max_passages,
-                indexed_count=total_vectors,
             )
-            if points:
-                vec_key = self._settings.qdrant_vector_name
-                vector_size = len(points[0]["vector"][vec_key])
-            batches_completed += 1
-            ticker.tick(
+            if resume_count:
+                LOGGER.info("resuming dense from checkpoint at %s passages", resume_count)
+            total_records = count_index_records_jsonl(
+                jsonl_path,
+                max_records=max_passages,
+                max_rows=max_index_rows,
+            )
+            remaining_records = max(total_records - resume_count, 0)
+            total_batches = math.ceil(remaining_records / lines_per_batch) if remaining_records else 0
+            ticker = ProgressTicker(
+                logger=LOGGER,
+                stage="dense_index",
+                label="batches",
+                total=total_batches,
+                every_items=self._settings.progress_log_every_batches,
+                every_seconds=self._settings.progress_log_every_seconds,
+            )
+            ticker.start(
+                input=jsonl_path,
+                collection=self._settings.qdrant_collection,
+                vector_name=self._settings.qdrant_vector_name,
+                records_total=total_records,
+                read_batch_lines=lines_per_batch,
+                embedding_batch_size=self._settings.embedding_batch_size,
+                checkpoint=checkpoint_path,
+            )
+            vector_size = 0
+            total_vectors = resume_count
+            batches_completed = 0
+            batch: list[IndexChunk | Passage] = []
+            consumed_non_empty_lines = 0
+
+            def flush() -> None:
+                nonlocal batches_completed, vector_size, total_vectors, batch
+                if not batch:
+                    return
+                texts = [_dense_embedding_text(p) for p in batch]
+                vectors = self._model.encode(
+                    texts,
+                    batch_size=self._settings.embedding_batch_size,
+                    normalize_embeddings=True,
+                )
+                points = [
+                    {
+                        "id": _record_id(passage),
+                        "vector": {self._settings.qdrant_vector_name: list(vector)},
+                        "payload": _qdrant_payload(passage),
+                    }
+                    for passage, vector in zip(batch, vectors, strict=True)
+                ]
+                _upsert_with_retry(
+                    client=self._client,
+                    collection_name=self._settings.qdrant_collection,
+                    points=points,
+                )
+                total_vectors += len(points)
+                _write_dense_checkpoint(
+                    path=checkpoint_path,
+                    silver_path=jsonl_path,
+                    collection_name=self._settings.qdrant_collection,
+                    vector_name=self._settings.qdrant_vector_name,
+                    max_index_rows=max_index_rows,
+                    max_passages=max_passages,
+                    indexed_count=total_vectors,
+                )
+                if points:
+                    vec_key = self._settings.qdrant_vector_name
+                    vector_size = len(points[0]["vector"][vec_key])
+                batches_completed += 1
+                ticker.tick(
+                    batches_completed,
+                    records_indexed=total_vectors,
+                    records_total=total_records,
+                    vector_size=vector_size,
+                    checkpoint=checkpoint_path,
+                )
+                batch = []
+
+            for record in iter_index_records_jsonl(
+                jsonl_path,
+                max_records=max_passages,
+                max_rows=max_index_rows,
+            ):
+                if consumed_non_empty_lines < resume_count:
+                    consumed_non_empty_lines += 1
+                    continue
+                batch.append(record)
+                if len(batch) >= lines_per_batch:
+                    flush()
+            flush()
+            _remove_dense_checkpoint(checkpoint_path)
+            ticker.finish(
                 batches_completed,
                 records_indexed=total_vectors,
                 records_total=total_records,
                 vector_size=vector_size,
-                checkpoint=checkpoint_path,
             )
-            batch = []
 
-        with jsonl_path.open("r", encoding="utf-8") as handle:
-            for raw in handle:
-                if max_passages is not None and total_vectors + len(batch) >= max_passages:
-                    break
-                line = raw.strip()
-                if not line:
-                    continue
-                if consumed_non_empty_lines < resume_count:
-                    consumed_non_empty_lines += 1
-                    continue
-                batch.append(_record_from_json(line))
-                if len(batch) >= lines_per_batch:
-                    flush()
-        flush()
-        _remove_dense_checkpoint(checkpoint_path)
-        ticker.finish(
-            batches_completed,
-            records_indexed=total_vectors,
-            records_total=total_records,
-            vector_size=vector_size,
-        )
-
-        return DenseBuildResult(vector_count=total_vectors, vector_size=vector_size)
+            return DenseBuildResult(vector_count=total_vectors, vector_size=vector_size)
 
     def count(self) -> int:
         """Return number of vectors in collection."""
@@ -349,6 +358,7 @@ def _load_dense_checkpoint(
     silver_path: Path,
     collection_name: str,
     vector_name: str,
+    max_index_rows: int | None,
     max_passages: int | None,
 ) -> int:
     if not path.is_file():
@@ -363,6 +373,7 @@ def _load_dense_checkpoint(
         "silver_path": str(silver_path.resolve()),
         "collection_name": collection_name,
         "vector_name": vector_name,
+        "max_index_rows": max_index_rows,
         "max_passages": max_passages,
     }
     for key, value in expected.items():
@@ -380,6 +391,7 @@ def _write_dense_checkpoint(
     silver_path: Path,
     collection_name: str,
     vector_name: str,
+    max_index_rows: int | None,
     max_passages: int | None,
     indexed_count: int,
 ) -> None:
@@ -390,6 +402,7 @@ def _write_dense_checkpoint(
         "silver_path": str(silver_path.resolve()),
         "collection_name": collection_name,
         "vector_name": vector_name,
+        "max_index_rows": max_index_rows,
         "max_passages": max_passages,
         "indexed_count": indexed_count,
         "updated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),

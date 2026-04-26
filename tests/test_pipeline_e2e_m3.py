@@ -12,6 +12,7 @@ from qdrant_client.http import models as qm
 from tests.conftest import FIXTURES_DIR, load_jsonl_fixture_rows
 
 from src.config.settings import Settings
+from src.ingestion.chunk_raw import run_chunk_ingest
 from src.ingestion import nq_loader
 from src.ingestion.ingest_silver import load_ingest_manifest, run_ingest
 from src.ingestion.models import SparseIndexManifest
@@ -121,6 +122,10 @@ def _build_settings(tmp_path: Path, *, collection: str, max_passages: int | None
         sparse_upsert_batch_size=2,
         sparse_workers=1,
         sparse_write_concurrency=1,
+        chunk_min_tokens_soft=1,
+        chunk_min_tokens_hard=1,
+        chunk_target_tokens=8,
+        chunk_max_tokens=40,
     )
 
 
@@ -130,14 +135,22 @@ def _run_pipeline_to_m3(
     client: InMemoryQdrantAdapter,
     model: TinyEmbeddingModel,
 ) -> None:
+    chunk_manifest, skipped = run_chunk_ingest(settings, force=True)
+    assert skipped is False
+    assert chunk_manifest.chunk_count > 0
     dense_indexer = DenseIndexer(settings=settings, client=client, model=model)
     dense_indexer.build_from_jsonl_streaming(
-        settings.passages_path,
+        settings.index_chunks_path,
         lines_per_batch=settings.dense_read_batch_lines,
+        max_index_rows=settings.max_index_rows,
         max_passages=settings.max_passages,
     )
     sparse_indexer = SparseQdrantIndexer(settings=settings, client=client)
-    sparse_indexer.build_from_jsonl(settings.passages_path, max_passages=settings.max_passages)
+    sparse_indexer.build_from_jsonl(
+        settings.index_chunks_path,
+        max_index_rows=settings.max_index_rows,
+        max_passages=settings.max_passages,
+    )
 
 
 def _assert_retrieval_modes(
@@ -185,6 +198,8 @@ def test_pipeline_e2e_m3_fixture_sample(tmp_path: Path, monkeypatch: pytest.Monk
     assert settings.sparse_manifest_path.is_file()
     assert settings.sparse_pass1_path.is_file()
     assert not settings.sparse_checkpoint_path.exists()
+    assert settings.index_chunks_path.is_file()
+    assert settings.chunk_manifest_path.is_file()
     assert load_ingest_manifest(settings.ingest_manifest_path) is not None
     loaded_sparse_manifest = SparseIndexManifest.model_validate_json(
         settings.sparse_manifest_path.read_text(encoding="utf-8")
@@ -192,10 +207,11 @@ def test_pipeline_e2e_m3_fixture_sample(tmp_path: Path, monkeypatch: pytest.Monk
     assert loaded_sparse_manifest.points_updated > 0
     pass1 = load_sparse_pass1_artifact(
         path=settings.sparse_pass1_path,
-        silver_path=settings.passages_path,
+        silver_path=settings.index_chunks_path,
+        max_index_rows=settings.max_index_rows,
         max_passages=settings.max_passages,
     )
-    assert pass1.document_count == ingest_manifest.line_count
+    assert pass1.document_count == loaded_sparse_manifest.points_updated
 
     _assert_retrieval_modes(settings, client, model)
 

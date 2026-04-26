@@ -19,12 +19,28 @@ def main() -> None:
         help="Retrieval mode to execute.",
     )
     parser.add_argument("--top-k", type=int, default=10, help="Maximum passages to return.")
+    parser.add_argument(
+        "--include-metrics",
+        action="store_true",
+        help="Print retrieval metrics alongside hits.",
+    )
     args = parser.parse_args()
 
     settings = Settings.from_env()
     retriever = QdrantModeRetriever(settings=settings, mode=args.mode)
     hits = retriever.retrieve(args.query, top_k=args.top_k)
-    print(json.dumps([hit.model_dump() for hit in hits], indent=2))
+    if args.include_metrics:
+        payload = {
+            "hits": [hit.model_dump() for hit in hits],
+            "metrics": (
+                retriever.last_retrieval_metrics.model_dump()
+                if retriever.last_retrieval_metrics is not None
+                else None
+            ),
+        }
+    else:
+        payload = [hit.model_dump() for hit in hits]
+    print(json.dumps(payload, indent=2))
 
 
 if __name__ == "__main__":

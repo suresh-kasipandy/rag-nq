@@ -8,12 +8,13 @@ import re
 import uuid
 from collections import Counter
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from src.config.settings import Settings
+from src.ingestion.chunk_store import flatten_index_chunk_group
 from src.ingestion.ingest_raw import (
     load_raw_manifest,
     raw_inputs_match_manifest,
@@ -25,6 +26,9 @@ from src.ingestion.models import (
     RAW_DATASET_SCHEMA_VERSION,
     ChunkManifest,
     IndexChunk,
+    IndexChunkGroup,
+    IndexChunkItem,
+    IndexText,
 )
 from src.ingestion.nq_loader import iter_raw_rows
 from src.observability.logging_setup import get_stage_logger
@@ -130,7 +134,7 @@ def should_skip_chunk_ingest(settings: Settings, *, force: bool = False) -> bool
         and manifest.chunk_schema_version == INDEX_CHUNK_SCHEMA_VERSION
         and manifest.dataset_name == settings.dataset_name
         and manifest.dataset_split == settings.dataset_split
-        and manifest.max_passages == settings.max_passages
+        and manifest.max_chunk_rows == settings.max_chunk_rows
         and manifest.raw_schema_version == RAW_DATASET_SCHEMA_VERSION
         and manifest.raw_row_count == raw_manifest.row_count
         and manifest.min_tokens_soft == settings.chunk_min_tokens_soft
@@ -155,8 +159,9 @@ def run_chunk_ingest(settings: Settings, *, force: bool = False) -> tuple[ChunkM
         manifest = load_chunk_manifest(settings.chunk_manifest_path)
         assert manifest is not None
         LOGGER.info(
-            "skip chunk ingest: chunk_manifest matches (%s chunks)",
+            "skip chunk ingest: chunk_manifest matches (%s groups, %s chunks)",
             manifest.line_count,
+            manifest.chunk_count,
             extra={"stage": "chunk"},
         )
         return manifest, True
@@ -171,25 +176,33 @@ def run_chunk_ingest(settings: Settings, *, force: bool = False) -> tuple[ChunkM
         logger=LOGGER,
         stage="chunk",
         label="rows",
-        total=raw_manifest.row_count,
+        total=(
+            min(raw_manifest.row_count, settings.max_chunk_rows)
+            if settings.max_chunk_rows is not None
+            else raw_manifest.row_count
+        ),
         every_items=settings.progress_log_every_records,
         every_seconds=settings.progress_log_every_seconds,
     )
     ticker.start(
         raw_path=settings.raw_dataset_path,
         output=settings.index_chunks_path,
+        max_chunk_rows=settings.max_chunk_rows,
         min_tokens_soft=settings.chunk_min_tokens_soft,
         max_tokens=settings.chunk_max_tokens,
     )
     state = _ChunkBuildState()
-    line_count = 0
+    group_count = 0
     with tmp_jsonl.open("w", encoding="utf-8") as handle:
-        for chunk in iter_index_chunks_from_raw_artifact(settings, state=state, ticker=ticker):
-            if settings.max_passages is not None and line_count >= settings.max_passages:
-                break
-            handle.write(chunk.model_dump_json())
+        groups = iter_index_chunk_groups_from_raw_artifact(
+            settings,
+            state=state,
+            ticker=ticker,
+        )
+        for group in groups:
+            handle.write(group.model_dump_json(exclude_none=True))
             handle.write("\n")
-            line_count += 1
+            group_count += 1
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp_jsonl, settings.index_chunks_path)
@@ -200,10 +213,12 @@ def run_chunk_ingest(settings: Settings, *, force: bool = False) -> tuple[ChunkM
         dataset_name=settings.dataset_name,
         dataset_split=settings.dataset_split,
         max_passages=settings.max_passages,
-        line_count=line_count,
+        max_chunk_rows=settings.max_chunk_rows,
+        line_count=group_count,
         raw_schema_version=raw_manifest.schema_version,
         raw_row_count=raw_manifest.row_count,
         created_at_utc=datetime.now(UTC).replace(microsecond=0).isoformat(),
+        chunk_count=state.chunks_emitted,
         min_tokens_soft=settings.chunk_min_tokens_soft,
         min_tokens_hard=settings.chunk_min_tokens_hard,
         target_tokens=settings.chunk_target_tokens,
@@ -226,7 +241,8 @@ def run_chunk_ingest(settings: Settings, *, force: bool = False) -> tuple[ChunkM
     os.replace(tmp_manifest, settings.chunk_manifest_path)
     ticker.finish(
         state.rows_processed,
-        chunks=line_count,
+        groups=group_count,
+        chunks=state.chunks_emitted,
         candidates=state.candidates,
         tiny=state.tiny_candidates,
         tiny_suppressed=state.tiny_suppressed,
@@ -247,8 +263,22 @@ def iter_index_chunks_from_raw_artifact(
 ) -> Iterator[IndexChunk]:
     """Yield deterministic index chunks from local raw dataset JSONL."""
 
+    for group in iter_index_chunk_groups_from_raw_artifact(settings, state=state, ticker=ticker):
+        yield from flatten_index_chunk_group(group)
+
+
+def iter_index_chunk_groups_from_raw_artifact(
+    settings: Settings,
+    *,
+    state: _ChunkBuildState | None = None,
+    ticker: ProgressTicker | None = None,
+) -> Iterator[IndexChunkGroup]:
+    """Yield grouped index chunks from local raw dataset JSONL."""
+
     build_state = state or _ChunkBuildState()
     for row_ordinal, row in enumerate(iter_raw_rows(settings.raw_dataset_path)):
+        if settings.max_chunk_rows is not None and row_ordinal >= settings.max_chunk_rows:
+            break
         build_state.rows_processed = row_ordinal + 1
         annotations = annotate_row_candidates(row, row_ordinal=row_ordinal, settings=settings)
         for annotation in annotations:
@@ -274,7 +304,8 @@ def iter_index_chunks_from_raw_artifact(
                 boilerplate=build_state.boilerplate,
                 context_expanded=build_state.context_expanded,
             )
-        yield from chunks
+        if chunks:
+            yield _group_from_chunks(row, row_ordinal, chunks, settings)
 
 
 def annotate_row_candidates(
@@ -537,9 +568,159 @@ def _make_chunk(
         chunk_kind=chunk_kind,
         token_count=token_count(text),
         context_token_count=token_count(context_text),
-        long_answers=[str(value) for value in row.get("long_answers", []) if value is not None]
-        if isinstance(row.get("long_answers"), list)
-        else [],
+        long_answers=_long_answers_from_row(row),
+    )
+
+
+def _chunk_items_from_chunks(
+    chunks: list[IndexChunk],
+    raw_texts: dict[int, str],
+    passage_types: dict[int, str | None],
+    text_pool: _TextPool,
+) -> list[IndexChunkItem]:
+    items: list[IndexChunkItem] = []
+    for chunk in chunks:
+        text_idxs = _refs_for_materialized_text(
+            chunk.text,
+            raw_texts=raw_texts,
+            passage_types=passage_types,
+            start_idx=chunk.start_candidate_idx,
+            end_idx=chunk.end_candidate_idx,
+            text_pool=text_pool,
+        )
+        context_idxs = _refs_for_materialized_text(
+            chunk.context_text,
+            raw_texts=raw_texts,
+            passage_types=passage_types,
+            start_idx=chunk.start_candidate_idx,
+            end_idx=chunk.end_candidate_idx,
+            text_pool=text_pool,
+        )
+        items.append(
+            IndexChunkItem(
+                chunk_id=chunk.chunk_id,
+                text_idxs=text_idxs,
+                context_idxs=context_idxs,
+                start_candidate_idx=chunk.start_candidate_idx,
+                end_candidate_idx=chunk.end_candidate_idx,
+                parent_candidate_idx=chunk.parent_candidate_idx,
+                passage_types=chunk.passage_types,
+                chunk_kind=chunk.chunk_kind,
+                token_count=chunk.token_count,
+                context_token_count=chunk.context_token_count,
+            )
+        )
+    return items
+
+
+@dataclass(slots=True)
+class _TextPool:
+    texts: list[IndexText] = field(default_factory=list)
+    _by_key: dict[tuple[str, int | None], int] = field(default_factory=dict)
+
+    def add(self, *, text: str, raw_idx: int | None, passage_type: str | None = None) -> int:
+        key = (text, raw_idx)
+        existing = self._by_key.get(key)
+        if existing is not None:
+            return existing
+        text_idx = len(self.texts)
+        self.texts.append(
+            IndexText(
+                text_idx=text_idx,
+                raw_idx=raw_idx,
+                text=text,
+                passage_type=passage_type,
+            )
+        )
+        self._by_key[key] = text_idx
+        return text_idx
+
+
+def _raw_candidate_texts(
+    row: Mapping[str, object],
+) -> tuple[dict[int, str], dict[int, str | None]]:
+    raw_candidates = row.get("candidates")
+    if not isinstance(raw_candidates, list):
+        return {}, {}
+    raw_types = row.get("passage_types")
+    type_list = raw_types if isinstance(raw_types, list) else []
+    texts: dict[int, str] = {}
+    passage_types: dict[int, str | None] = {}
+    for idx, raw_candidate in enumerate(raw_candidates):
+        text = normalize_text(raw_candidate)
+        if not text:
+            continue
+        passage_type = str(type_list[idx]).strip() if idx < len(type_list) else None
+        texts[idx] = text
+        passage_types[idx] = passage_type or None
+    return texts, passage_types
+
+
+def _refs_for_materialized_text(
+    text: str,
+    *,
+    raw_texts: dict[int, str],
+    passage_types: dict[int, str | None],
+    start_idx: int,
+    end_idx: int,
+    text_pool: _TextPool,
+) -> list[int]:
+    span_candidates = [
+        (idx, raw_texts[idx])
+        for idx in range(start_idx, end_idx + 1)
+        if idx in raw_texts
+    ]
+    matched = _match_candidate_texts(text, span_candidates)
+    if matched is None:
+        matched = _match_candidate_texts(text, sorted(raw_texts.items()))
+    if matched is None:
+        return [text_pool.add(text=text, raw_idx=None)]
+    return [
+        text_pool.add(
+            text=raw_texts[idx],
+            raw_idx=idx,
+            passage_type=passage_types.get(idx),
+        )
+        for idx in matched
+    ]
+
+
+def _match_candidate_texts(
+    text: str, candidates: list[tuple[int, str]]
+) -> list[int] | None:
+    matched: list[int] = []
+    text_pos = 0
+    for raw_idx, candidate_text in candidates:
+        prefix = candidate_text if text_pos == 0 else f" {candidate_text}"
+        if not text.startswith(prefix, text_pos):
+            continue
+        matched.append(raw_idx)
+        text_pos += len(prefix)
+        if text_pos == len(text):
+            return matched
+    return None
+
+
+def _group_from_chunks(
+    row: Mapping[str, object],
+    row_ordinal: int,
+    chunks: list[IndexChunk],
+    settings: Settings,
+) -> IndexChunkGroup:
+    title = _optional_str(row.get("title"))
+    text_pool = _TextPool()
+    raw_texts, passage_types = _raw_candidate_texts(row)
+    items = _chunk_items_from_chunks(chunks, raw_texts, passage_types, text_pool)
+    return IndexChunkGroup(
+        group_id=f"{settings.dataset_name}:{settings.dataset_split}:{row_ordinal}",
+        source_row_ordinal=row_ordinal,
+        texts=text_pool.texts,
+        title=title,
+        source=title,
+        question=_optional_str(row.get("question")),
+        document_url=_optional_str(row.get("document_url")),
+        long_answers=_long_answers_from_row(row),
+        chunks=items,
     )
 
 
@@ -671,3 +852,10 @@ def _optional_str(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _long_answers_from_row(row: Mapping[str, object]) -> list[str]:
+    raw = row.get("long_answers")
+    if not isinstance(raw, list):
+        return []
+    return [str(value) for value in raw if value is not None]

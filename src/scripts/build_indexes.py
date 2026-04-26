@@ -22,7 +22,7 @@ def build_indexes(settings: Settings) -> IndexBuildManifest:
 
     LOGGER.info("stage start: chunk ingest", extra={"stage": "build"})
     chunk_manifest, _ = run_chunk_ingest(settings, force=Settings.force_ingest_from_env())
-    chunk_count = chunk_manifest.line_count
+    chunk_count = chunk_manifest.chunk_count
 
     dense_indexed_from = "artifact"
     LOGGER.info(
@@ -36,7 +36,7 @@ def build_indexes(settings: Settings) -> IndexBuildManifest:
     dense_result = dense_indexer.build_from_jsonl_streaming(
         settings.index_chunks_path,
         lines_per_batch=settings.dense_read_batch_lines,
-        max_passages=settings.max_passages,
+        max_index_rows=settings.max_index_rows,
     )
     LOGGER.info(
         "vectors=%s vector_size=%s",
@@ -48,7 +48,8 @@ def build_indexes(settings: Settings) -> IndexBuildManifest:
     LOGGER.info("stage start: sparse index chunks=%s", chunk_count, extra={"stage": "build"})
     sparse_indexer = SparseQdrantIndexer(settings=settings)
     sparse_result = sparse_indexer.build_from_jsonl(
-        settings.index_chunks_path, max_passages=settings.max_passages
+        settings.index_chunks_path,
+        max_index_rows=settings.max_index_rows,
     )
     LOGGER.info(
         "documents=%s sparse_vocab=%s points_updated=%s",
@@ -70,6 +71,7 @@ def build_indexes(settings: Settings) -> IndexBuildManifest:
         chunk_schema_version=INDEX_CHUNK_SCHEMA_VERSION,
         chunk_artifact_path=str(settings.index_chunks_path),
         dense_indexed_from=dense_indexed_from,
+        max_index_rows=settings.max_index_rows,
     )
     PassageStore.write_manifest(manifest=manifest, path=settings.manifest_path)
     LOGGER.info("wrote manifest", extra={"stage": "manifest"})

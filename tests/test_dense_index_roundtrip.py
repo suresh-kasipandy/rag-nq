@@ -7,12 +7,16 @@ from src.retrieval.dense_index import DenseIndexer
 
 
 class FakeEmbeddingModel:
+    def __init__(self) -> None:
+        self.last_texts: list[str] = []
+
     def get_sentence_embedding_dimension(self) -> int:
         return 3
 
     def encode(self, texts, *, batch_size: int, normalize_embeddings: bool):
         assert batch_size > 0
         assert normalize_embeddings is True
+        self.last_texts = list(texts)
         return [[0.1, 0.2, 0.3] for _ in texts]
 
 
@@ -66,8 +70,8 @@ def test_dense_index_build_and_count() -> None:
         assert result.vector_count == 2
         assert result.vector_size == 3
         assert indexer.count() == 2
-        assert fake_client.points[0]["payload"] == {"text": "A", "source": "x"}
-        assert fake_client.points[1]["payload"] == {"text": "B", "source": "y"}
+        assert fake_client.points[0]["payload"] == {"text": "A"}
+        assert fake_client.points[1]["payload"] == {"text": "B"}
     finally:
         dense_index._build_vector_params = original_build_vector_params
 
@@ -100,12 +104,12 @@ def test_dense_index_payload_includes_optional_passage_metadata() -> None:
         indexer.build(passages)
         assert fake_client.points[0]["payload"] == {
             "text": "body",
-            "source": "src",
             "title": "T",
             "question": "Q?",
             "passage_type": "wiki",
             "document_url": "https://example.com",
             "long_answers": ["42"],
         }
+        assert fake_model.last_texts == ["body\nTitle: T"]
     finally:
         dense_index._build_vector_params = original_build_vector_params

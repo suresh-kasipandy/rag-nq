@@ -9,7 +9,7 @@ from typing import Literal
 # Bump when schema / ingest semantics change (skip-if-fresh gate).
 RAW_DATASET_SCHEMA_VERSION = "1"
 SILVER_SCHEMA_VERSION = "1"
-INDEX_CHUNK_SCHEMA_VERSION = "1"
+INDEX_CHUNK_SCHEMA_VERSION = "3"
 CHUNK_MANIFEST_SCHEMA_VERSION = "1"
 SPARSE_INDEX_MANIFEST_VERSION = "1"
 
@@ -53,7 +53,7 @@ class Passage(_DataclassModel):
 
     passage_id: str
     text: str
-    source: str | None = None
+    source: str | None = None  # Deprecated for Qdrant payloads; prefer title.
     title: str | None = None
     question: str | None = None
     passage_type: str | None = None
@@ -80,7 +80,7 @@ class IndexChunk(_DataclassModel):
     end_candidate_idx: int
     passage_types: list[str | None] = field(default_factory=list)
     title: str | None = None
-    source: str | None = None
+    source: str | None = None  # Deprecated for Qdrant payloads; prefer title.
     question: str | None = None
     document_url: str | None = None
     parent_candidate_idx: int | None = None
@@ -105,6 +105,117 @@ class IndexChunk(_DataclassModel):
 
 
 @dataclass(slots=True)
+class IndexText(_DataclassModel):
+    """Text pool entry stored once per grouped chunk artifact row."""
+
+    text_idx: int
+    text: str
+    raw_idx: int | None = None
+    passage_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.text_idx < 0:
+            raise ValueError("text_idx must be >= 0.")
+        if not self.text.strip():
+            raise ValueError("text must be non-empty.")
+        if self.raw_idx is not None and self.raw_idx < 0:
+            raise ValueError("raw_idx must be >= 0.")
+
+
+@dataclass(slots=True)
+class IndexChunkItem(_DataclassModel):
+    """Per-chunk references stored inside grouped ``index_chunks.jsonl`` rows."""
+
+    chunk_id: str
+    text_idxs: list[int]
+    context_idxs: list[int]
+    start_candidate_idx: int
+    end_candidate_idx: int
+    passage_types: list[str | None] = field(default_factory=list)
+    parent_candidate_idx: int | None = None
+    chunk_kind: str = "chunk"
+    token_count: int = 0
+    context_token_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.chunk_id.strip():
+            raise ValueError("chunk_id must be non-empty.")
+        if not self.text_idxs:
+            raise ValueError("text_idxs must be non-empty.")
+        if not self.context_idxs:
+            raise ValueError("context_idxs must be non-empty.")
+        if any(idx < 0 for idx in self.text_idxs):
+            raise ValueError("text_idxs must be >= 0.")
+        if any(idx < 0 for idx in self.context_idxs):
+            raise ValueError("context_idxs must be >= 0.")
+        if self.start_candidate_idx < 0 or self.end_candidate_idx < self.start_candidate_idx:
+            raise ValueError("candidate span is invalid.")
+
+
+@dataclass(slots=True)
+class IndexChunkGroup(_DataclassModel):
+    """Grouped chunk artifact row: shared source metadata plus per-chunk records."""
+
+    group_id: str
+    source_row_ordinal: int
+    texts: list[IndexText]
+    chunks: list[IndexChunkItem]
+    title: str | None = None
+    source: str | None = None  # Deprecated for Qdrant payloads; prefer title.
+    question: str | None = None
+    document_url: str | None = None
+    long_answers: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.group_id.strip():
+            raise ValueError("group_id must be non-empty.")
+        if self.source_row_ordinal < 0:
+            raise ValueError("source_row_ordinal must be >= 0.")
+        if not self.texts:
+            raise ValueError("texts must be non-empty.")
+        if not self.chunks:
+            raise ValueError("chunks must be non-empty.")
+        for expected_idx, text in enumerate(self.texts):
+            if text.text_idx != expected_idx:
+                raise ValueError("texts text_idx values must match list positions.")
+        valid_text_idxs = {text.text_idx for text in self.texts}
+        for chunk in self.chunks:
+            if any(idx not in valid_text_idxs for idx in chunk.text_idxs):
+                raise ValueError("chunk text_idxs must reference group texts.")
+            if any(idx not in valid_text_idxs for idx in chunk.context_idxs):
+                raise ValueError("chunk context_idxs must reference group texts.")
+
+    @classmethod
+    def model_validate(cls, payload: dict[str, object]) -> IndexChunkGroup:
+        raw_chunks = payload.get("chunks")
+        raw_texts = payload.get("texts")
+        if not isinstance(raw_texts, list):
+            raise ValueError("IndexChunkGroup.texts must be a list.")
+        if not isinstance(raw_chunks, list):
+            raise ValueError("IndexChunkGroup.chunks must be a list.")
+        texts: list[IndexText] = []
+        for item in raw_texts:
+            if isinstance(item, IndexText):
+                texts.append(item)
+            elif isinstance(item, dict):
+                texts.append(IndexText.model_validate(item))
+            else:
+                raise ValueError("IndexChunkGroup.texts entries must be objects.")
+        chunks: list[IndexChunkItem] = []
+        for item in raw_chunks:
+            if isinstance(item, IndexChunkItem):
+                chunks.append(item)
+            elif isinstance(item, dict):
+                chunks.append(IndexChunkItem.model_validate(item))
+            else:
+                raise ValueError("IndexChunkGroup.chunks entries must be objects.")
+        data = dict(payload)
+        data["texts"] = texts
+        data["chunks"] = chunks
+        return cls(**data)
+
+
+@dataclass(slots=True)
 class ChunkManifest(_DataclassModel):
     """Metadata for the chunked ``index_chunks.jsonl`` artifact."""
 
@@ -117,6 +228,8 @@ class ChunkManifest(_DataclassModel):
     raw_row_count: int
     created_at_utc: str
     max_passages: int | None = None
+    max_chunk_rows: int | None = None
+    chunk_count: int = 0
     min_tokens_soft: int = 60
     min_tokens_hard: int = 20
     target_tokens: int = 160
@@ -136,6 +249,8 @@ class ChunkManifest(_DataclassModel):
             raise ValueError("line_count must be >= 0.")
         if self.raw_row_count < 0:
             raise ValueError("raw_row_count must be >= 0.")
+        if self.chunk_count < 0:
+            raise ValueError("chunk_count must be >= 0.")
 
 
 @dataclass(slots=True)
@@ -148,6 +263,7 @@ class RawDatasetManifest(_DataclassModel):
     row_count: int
     created_at_utc: str
     max_passages: int | None = None
+    max_raw_rows: int | None = None
 
     def __post_init__(self) -> None:
         if self.row_count < 0:
@@ -189,6 +305,7 @@ class IndexBuildManifest(_DataclassModel):
     chunk_schema_version: str | None = None
     chunk_artifact_path: str | None = None
     dense_indexed_from: Literal["artifact", "hf"] | None = None
+    max_index_rows: int | None = None
 
 
 @dataclass(slots=True)
@@ -206,6 +323,7 @@ class SparseIndexManifest(_DataclassModel):
     sparse_upsert_batch_size: int = 256
     sparse_analyzer: str = "regex_stem_stop"
     sparse_analyzer_version: str = "1"
+    max_index_rows: int | None = None
     document_count: int = 0
     vocabulary_size: int = 0
     points_updated: int = 0

@@ -49,7 +49,7 @@ def main() -> None:
     result = indexer.build_from_jsonl_streaming(
         settings.index_chunks_path,
         lines_per_batch=settings.dense_read_batch_lines,
-        max_passages=settings.max_passages,
+        max_index_rows=settings.max_index_rows,
     )
     LOGGER.info(
         "dense_index complete: vectors=%s dim=%s schema=%s",

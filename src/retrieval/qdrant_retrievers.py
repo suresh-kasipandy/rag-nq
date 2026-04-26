@@ -1,19 +1,34 @@
-"""Milestone 3 retrievers: dense, sparse, and hybrid retrieval backed by Qdrant."""
+"""Qdrant-backed dense, sparse, hybrid, and reranked retrieval."""
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Literal, Protocol
 
 from src.config.settings import Settings
 from src.contracts.retrieval import Retriever
-from src.models.query_schemas import PassageHit
+from src.models.query_schemas import (
+    DedupeMetrics,
+    PassageHit,
+    RetrievalMetrics,
+    RetrievalStageTimings,
+)
+from src.retrieval.rerank import (
+    CrossEncoderLike,
+    build_default_cross_encoder,
+    dedupe_hits,
+    rerank_hits,
+)
 from src.retrieval.sparse_qdrant import (
     SparsePass1Data,
     encode_query_sparse_vector,
     load_sparse_pass1_artifact,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 class QueryEmbeddingModel(Protocol):
@@ -94,6 +109,7 @@ class SparseQdrantRetriever:
             self.pass1_data = load_sparse_pass1_artifact(
                 path=self.settings.sparse_pass1_path,
                 silver_path=self.settings.index_chunks_path,
+                max_index_rows=self.settings.max_index_rows,
                 max_passages=self.settings.max_passages,
                 sparse_analyzer=self.settings.sparse_analyzer,
             )
@@ -128,46 +144,88 @@ class HybridQdrantRetriever:
     settings: Settings
     dense: DenseQdrantRetriever | None = None
     sparse: SparseQdrantRetriever | None = None
+    reranker: CrossEncoderLike | None = None
+    last_dedupe_metrics: DedupeMetrics | None = None
+    last_stage_timings: RetrievalStageTimings | None = None
 
     def __post_init__(self) -> None:
         if self.dense is None:
             self.dense = DenseQdrantRetriever(settings=self.settings)
         if self.sparse is None:
             self.sparse = SparseQdrantRetriever(settings=self.settings)
+        if self.settings.rerank_enabled and self.reranker is None:
+            self.reranker = build_default_cross_encoder(self.settings.rerank_model_name)
 
     def retrieve(self, query: str, top_k: int) -> list[PassageHit]:
-        dense_hits = self.dense.retrieve(query, top_k)
-        sparse_hits = self.sparse.retrieve(query, top_k)
+        started_at = time.monotonic()
+        candidate_k = max(top_k, self.settings.retrieve_k)
+        dense_hits = self.dense.retrieve(query, candidate_k)
+        sparse_hits = self.sparse.retrieve(query, candidate_k)
+        retrieved_at = time.monotonic()
         combined: dict[str, PassageHit] = {}
         fusion_score: dict[str, float] = {}
         rrf_k = float(self.settings.hybrid_rrf_k)
 
         for hit in dense_hits:
-            combined[hit.passage_id] = hit.model_copy(deep=True)
+            combined[hit.point_id] = hit.model_copy(deep=True)
             if hit.dense_rank is not None:
-                fusion_score[hit.passage_id] = fusion_score.get(hit.passage_id, 0.0) + (
+                fusion_score[hit.point_id] = fusion_score.get(hit.point_id, 0.0) + (
                     self.settings.hybrid_dense_weight / (rrf_k + float(hit.dense_rank))
                 )
 
         for hit in sparse_hits:
-            existing = combined.get(hit.passage_id)
+            existing = combined.get(hit.point_id)
             if existing is None:
-                combined[hit.passage_id] = hit.model_copy(deep=True)
+                combined[hit.point_id] = hit.model_copy(deep=True)
             else:
                 existing.sparse_score = hit.sparse_score
                 existing.sparse_rank = hit.sparse_rank
             if hit.sparse_rank is not None:
-                fusion_score[hit.passage_id] = fusion_score.get(hit.passage_id, 0.0) + (
+                fusion_score[hit.point_id] = fusion_score.get(hit.point_id, 0.0) + (
                     self.settings.hybrid_sparse_weight / (rrf_k + float(hit.sparse_rank))
                 )
 
         ranked = sorted(
             combined.values(),
-            key=lambda hit: (-fusion_score.get(hit.passage_id, 0.0), hit.passage_id),
-        )[:top_k]
+            key=lambda hit: (-fusion_score.get(hit.point_id, 0.0), hit.point_id),
+        )
         for rank, hit in enumerate(ranked, start=1):
             hit.fusion_rank = rank
-        return ranked
+
+        fused_at = time.monotonic()
+        if self.settings.rerank_enabled and self.reranker is not None:
+            ranked = rerank_hits(
+                query=query,
+                hits=ranked,
+                model=self.reranker,
+                context_token_budget=self.settings.rerank_context_token_budget,
+            )
+        reranked_at = time.monotonic()
+
+        final_k = min(top_k, self.settings.rerank_k or top_k)
+        if self.settings.retrieval_dedupe_enabled:
+            deduped = dedupe_hits(ranked, top_k=final_k)
+            final_hits = deduped.hits
+            self.last_dedupe_metrics = deduped.metrics
+        else:
+            final_hits = ranked[:final_k]
+            self.last_dedupe_metrics = None
+        finished_at = time.monotonic()
+        self.last_stage_timings = RetrievalStageTimings(
+            retrieve_seconds=retrieved_at - started_at,
+            fusion_seconds=fused_at - retrieved_at,
+            rerank_seconds=reranked_at - fused_at,
+            dedupe_seconds=finished_at - reranked_at,
+            total_seconds=finished_at - started_at,
+        )
+        LOGGER.info(
+            "hybrid retrieval complete raw=%s final=%s dedupe_drops=%s timings=%s",
+            len(ranked),
+            len(final_hits),
+            self.last_dedupe_metrics.dedupe_drop_count if self.last_dedupe_metrics else 0,
+            self.last_stage_timings.model_dump(),
+        )
+        return final_hits
 
 
 @dataclass(slots=True)
@@ -179,16 +237,17 @@ class QdrantModeRetriever:
     dense: Retriever | None = None
     sparse: Retriever | None = None
     hybrid: Retriever | None = None
+    last_retrieval_metrics: RetrievalMetrics | None = None
 
     def retrieve(self, query: str, top_k: int) -> list[PassageHit]:
         if self.mode == "dense":
             if self.dense is None:
                 self.dense = DenseQdrantRetriever(settings=self.settings)
-            return self.dense.retrieve(query, top_k)
+            return self._retrieve_single_mode(self.dense, query=query, top_k=top_k)
         if self.mode == "sparse":
             if self.sparse is None:
                 self.sparse = SparseQdrantRetriever(settings=self.settings)
-            return self.sparse.retrieve(query, top_k)
+            return self._retrieve_single_mode(self.sparse, query=query, top_k=top_k)
         if self.mode == "hybrid":
             if self.hybrid is None:
                 dense = self.dense or DenseQdrantRetriever(settings=self.settings)
@@ -198,8 +257,44 @@ class QdrantModeRetriever:
                     dense=dense,
                     sparse=sparse,
                 )
-            return self.hybrid.retrieve(query, top_k)
+            hits = self.hybrid.retrieve(query, top_k)
+            dedupe_metrics = getattr(self.hybrid, "last_dedupe_metrics", None)
+            timings = getattr(self.hybrid, "last_stage_timings", None)
+            self.last_retrieval_metrics = (
+                RetrievalMetrics(dedupe=dedupe_metrics, timings=timings)
+                if dedupe_metrics is not None or timings is not None
+                else None
+            )
+            return hits
         raise ValueError(f"Unsupported retrieval mode {self.mode!r}.")
+
+    def _retrieve_single_mode(
+        self, retriever: Retriever, *, query: str, top_k: int
+    ) -> list[PassageHit]:
+        started_at = time.monotonic()
+        candidate_k = max(top_k, self.settings.retrieve_k)
+        hits = retriever.retrieve(query, candidate_k)
+        retrieved_at = time.monotonic()
+        if not self.settings.retrieval_dedupe_enabled:
+            finished_at = time.monotonic()
+            self.last_retrieval_metrics = RetrievalMetrics(
+                timings=RetrievalStageTimings(
+                    retrieve_seconds=retrieved_at - started_at,
+                    total_seconds=finished_at - started_at,
+                )
+            )
+            return hits[:top_k]
+        deduped = dedupe_hits(hits, top_k=top_k)
+        finished_at = time.monotonic()
+        self.last_retrieval_metrics = RetrievalMetrics(
+            dedupe=deduped.metrics,
+            timings=RetrievalStageTimings(
+                retrieve_seconds=retrieved_at - started_at,
+                dedupe_seconds=finished_at - retrieved_at,
+                total_seconds=finished_at - started_at,
+            ),
+        )
+        return deduped.hits
 
 
 def _build_default_qdrant_client(url: str, *, timeout: float) -> Any:
@@ -242,18 +337,15 @@ def _to_hits(points: list[Any], *, score_field: str, rank_field: str) -> list[Pa
         text = payload.get("text")
         if not isinstance(text, str) or not text:
             continue
-        source = payload.get("source")
-        chunk_id = payload.get("chunk_id")
         context_text = payload.get("context_text")
         title = payload.get("title")
         document_url = payload.get("document_url")
         score = float(getattr(point, "score", 0.0))
+        point_id = str(getattr(point, "id", ""))
         data: dict[str, Any] = {
-            "passage_id": str(getattr(point, "id", "")),
-            "chunk_id": chunk_id if isinstance(chunk_id, str) else str(getattr(point, "id", "")),
+            "point_id": point_id,
             "text": text,
             "context_text": context_text if isinstance(context_text, str) else None,
-            "source": source if isinstance(source, str) else None,
             "title": title if isinstance(title, str) else None,
             "document_url": document_url if isinstance(document_url, str) else None,
             score_field: score,

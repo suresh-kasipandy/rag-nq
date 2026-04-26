@@ -26,7 +26,7 @@ def main() -> None:
     indexer = SparseQdrantIndexer(settings=settings)
     result = indexer.build_from_jsonl(
         settings.index_chunks_path,
-        max_passages=settings.max_passages,
+        max_index_rows=settings.max_index_rows,
     )
     LOGGER.info(
         "sparse_qdrant_index complete: documents=%s vocab=%s points_updated=%s manifest=%s",

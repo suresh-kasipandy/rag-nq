@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+
+import pytest
 
 from src.config.settings import Settings
 from src.ingestion.chunk_raw import (
@@ -124,12 +127,15 @@ def test_context_text_expands_structurally_dependent_chunk(tmp_path) -> None:
     assert chunks[1].context_text.endswith(chunks[1].text)
 
 
-def test_run_chunk_ingest_writes_manifest_and_skips_when_fresh(tmp_path) -> None:
+def test_run_chunk_ingest_writes_manifest_and_skips_when_fresh(
+    tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
     settings = Settings(
         output_dir=tmp_path,
         chunk_min_tokens_soft=12,
         chunk_min_tokens_hard=5,
         chunk_max_tokens=80,
+        progress_log_every_records=1,
     )
     _write_raw_fixture(
         settings,
@@ -145,6 +151,7 @@ def test_run_chunk_ingest_writes_manifest_and_skips_when_fresh(tmp_path) -> None
         ],
     )
 
+    caplog.set_level(logging.INFO)
     manifest, skipped = run_chunk_ingest(settings)
     second_manifest, second_skipped = run_chunk_ingest(settings)
 
@@ -155,3 +162,7 @@ def test_run_chunk_ingest_writes_manifest_and_skips_when_fresh(tmp_path) -> None
     assert manifest.chunk_schema_version == INDEX_CHUNK_SCHEMA_VERSION
     assert settings.index_chunks_path.is_file()
     assert settings.chunk_manifest_path.is_file()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("[chunk] start rows=0/1" in message for message in messages)
+    assert any("[chunk] progress rows=1/1" in message for message in messages)
+    assert any("[chunk] complete rows=1/1" in message for message in messages)

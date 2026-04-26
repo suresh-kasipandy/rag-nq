@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+import pytest
+
 from src.config.settings import Settings
 from src.ingestion.models import IndexChunk, Passage
 from src.retrieval import dense_index
@@ -90,7 +94,9 @@ def test_dense_jsonl_streaming_batches(tmp_path) -> None:
         dense_index._build_vector_params = original_build_vector_params
 
 
-def test_dense_jsonl_streaming_accepts_index_chunks(tmp_path) -> None:
+def test_dense_jsonl_streaming_accepts_index_chunks(
+    tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
     path = tmp_path / "index_chunks.jsonl"
     chunk = IndexChunk(
         chunk_id="11111111-1111-1111-1111-111111111111",
@@ -104,7 +110,11 @@ def test_dense_jsonl_streaming_accepts_index_chunks(tmp_path) -> None:
     )
     path.write_text(chunk.model_dump_json() + "\n", encoding="utf-8")
 
-    settings = Settings(qdrant_collection="c_chunks", embedding_batch_size=8)
+    settings = Settings(
+        qdrant_collection="c_chunks",
+        embedding_batch_size=8,
+        progress_log_every_batches=1,
+    )
     fake_client = FakeQdrantClient()
     fake_model = FakeEmbeddingModel()
     indexer = DenseIndexer(settings=settings, client=fake_client, model=fake_model)
@@ -114,10 +124,15 @@ def test_dense_jsonl_streaming_accepts_index_chunks(tmp_path) -> None:
         return {"size": size, "distance": distance_name}
 
     dense_index._build_vector_params = _stub_vector_params
+    caplog.set_level(logging.INFO)
     try:
         result = indexer.build_from_jsonl_streaming(path, lines_per_batch=2)
         assert result.vector_count == 1
         assert fake_client.upsert_batches == [1]
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("start batches=0/1" in message for message in messages)
+        assert any("progress batches=1/1" in message for message in messages)
+        assert any("complete batches=1/1" in message for message in messages)
     finally:
         dense_index._build_vector_params = original_build_vector_params
 

@@ -20,12 +20,13 @@ def build_indexes(settings: Settings) -> IndexBuildManifest:
 
     settings.output_dir.mkdir(parents=True, exist_ok=True)
 
+    LOGGER.info("stage start: chunk ingest", extra={"stage": "build"})
     chunk_manifest, _ = run_chunk_ingest(settings, force=Settings.force_ingest_from_env())
     chunk_count = chunk_manifest.line_count
 
     dense_indexed_from = "artifact"
     LOGGER.info(
-        "dense_index source=%s chunks=%s",
+        "stage start: dense index source=%s chunks=%s",
         dense_indexed_from,
         chunk_count,
         extra={"stage": "dense_index", "dense_source": dense_indexed_from},
@@ -44,6 +45,7 @@ def build_indexes(settings: Settings) -> IndexBuildManifest:
         extra={"stage": "dense_index"},
     )
 
+    LOGGER.info("stage start: sparse index chunks=%s", chunk_count, extra={"stage": "build"})
     sparse_indexer = SparseQdrantIndexer(settings=settings)
     sparse_result = sparse_indexer.build_from_jsonl(
         settings.index_chunks_path, max_passages=settings.max_passages
@@ -56,6 +58,7 @@ def build_indexes(settings: Settings) -> IndexBuildManifest:
         extra={"stage": "sparse_qdrant_index"},
     )
 
+    LOGGER.info("stage start: write manifest", extra={"stage": "build"})
     manifest = IndexBuildManifest(
         dataset_name=settings.dataset_name,
         dataset_split=settings.dataset_split,

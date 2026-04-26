@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import Sequence
@@ -14,6 +15,7 @@ from typing import Any, Protocol
 
 from src.config.settings import Settings
 from src.ingestion.models import IndexChunk, Passage
+from src.observability.progress import ProgressTicker, count_non_empty_jsonl
 
 LOGGER = logging.getLogger(__name__)
 
@@ -162,13 +164,34 @@ class DenseIndexer:
         )
         if resume_count:
             LOGGER.info("resuming dense from checkpoint at %s passages", resume_count)
+        total_records = count_non_empty_jsonl(jsonl_path, max_records=max_passages)
+        remaining_records = max(total_records - resume_count, 0)
+        total_batches = math.ceil(remaining_records / lines_per_batch) if remaining_records else 0
+        ticker = ProgressTicker(
+            logger=LOGGER,
+            stage="dense_index",
+            label="batches",
+            total=total_batches,
+            every_items=self._settings.progress_log_every_batches,
+            every_seconds=self._settings.progress_log_every_seconds,
+        )
+        ticker.start(
+            input=jsonl_path,
+            collection=self._settings.qdrant_collection,
+            vector_name=self._settings.qdrant_vector_name,
+            records_total=total_records,
+            read_batch_lines=lines_per_batch,
+            embedding_batch_size=self._settings.embedding_batch_size,
+            checkpoint=checkpoint_path,
+        )
         vector_size = 0
         total_vectors = resume_count
+        batches_completed = 0
         batch: list[IndexChunk | Passage] = []
         consumed_non_empty_lines = 0
 
         def flush() -> None:
-            nonlocal vector_size, total_vectors, batch
+            nonlocal batches_completed, vector_size, total_vectors, batch
             if not batch:
                 return
             texts = [p.text for p in batch]
@@ -202,6 +225,14 @@ class DenseIndexer:
             if points:
                 vec_key = self._settings.qdrant_vector_name
                 vector_size = len(points[0]["vector"][vec_key])
+            batches_completed += 1
+            ticker.tick(
+                batches_completed,
+                records_indexed=total_vectors,
+                records_total=total_records,
+                vector_size=vector_size,
+                checkpoint=checkpoint_path,
+            )
             batch = []
 
         with jsonl_path.open("r", encoding="utf-8") as handle:
@@ -219,6 +250,12 @@ class DenseIndexer:
                     flush()
         flush()
         _remove_dense_checkpoint(checkpoint_path)
+        ticker.finish(
+            batches_completed,
+            records_indexed=total_vectors,
+            records_total=total_records,
+            vector_size=vector_size,
+        )
 
         return DenseBuildResult(vector_count=total_vectors, vector_size=vector_size)
 

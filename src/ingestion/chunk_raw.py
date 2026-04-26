@@ -28,6 +28,7 @@ from src.ingestion.models import (
 )
 from src.ingestion.nq_loader import iter_raw_rows
 from src.observability.logging_setup import get_stage_logger
+from src.observability.progress import ProgressTicker
 
 LOGGER = get_stage_logger(__name__)
 
@@ -76,6 +77,8 @@ class CandidateAnnotation:
 
 @dataclass(slots=True)
 class _ChunkBuildState:
+    rows_processed: int = 0
+    chunks_emitted: int = 0
     candidates: int = 0
     boilerplate: int = 0
     duplicate_child: int = 0
@@ -164,10 +167,24 @@ def run_chunk_ingest(settings: Settings, *, force: bool = False) -> tuple[ChunkM
     )
     settings.output_dir.mkdir(parents=True, exist_ok=True)
 
+    ticker = ProgressTicker(
+        logger=LOGGER,
+        stage="chunk",
+        label="rows",
+        total=raw_manifest.row_count,
+        every_items=settings.progress_log_every_records,
+        every_seconds=settings.progress_log_every_seconds,
+    )
+    ticker.start(
+        raw_path=settings.raw_dataset_path,
+        output=settings.index_chunks_path,
+        min_tokens_soft=settings.chunk_min_tokens_soft,
+        max_tokens=settings.chunk_max_tokens,
+    )
     state = _ChunkBuildState()
     line_count = 0
     with tmp_jsonl.open("w", encoding="utf-8") as handle:
-        for chunk in iter_index_chunks_from_raw_artifact(settings, state=state):
+        for chunk in iter_index_chunks_from_raw_artifact(settings, state=state, ticker=ticker):
             if settings.max_passages is not None and line_count >= settings.max_passages:
                 break
             handle.write(chunk.model_dump_json())
@@ -207,17 +224,32 @@ def run_chunk_ingest(settings: Settings, *, force: bool = False) -> tuple[ChunkM
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp_manifest, settings.chunk_manifest_path)
-    LOGGER.info("wrote chunks (%s lines)", line_count, extra={"stage": "chunk"})
+    ticker.finish(
+        state.rows_processed,
+        chunks=line_count,
+        candidates=state.candidates,
+        tiny=state.tiny_candidates,
+        tiny_suppressed=state.tiny_suppressed,
+        duplicate_child=state.duplicate_child,
+        boilerplate=state.boilerplate,
+        context_expanded=state.context_expanded,
+        output=settings.index_chunks_path,
+        manifest=settings.chunk_manifest_path,
+    )
     return manifest, False
 
 
 def iter_index_chunks_from_raw_artifact(
-    settings: Settings, *, state: _ChunkBuildState | None = None
+    settings: Settings,
+    *,
+    state: _ChunkBuildState | None = None,
+    ticker: ProgressTicker | None = None,
 ) -> Iterator[IndexChunk]:
     """Yield deterministic index chunks from local raw dataset JSONL."""
 
     build_state = state or _ChunkBuildState()
     for row_ordinal, row in enumerate(iter_raw_rows(settings.raw_dataset_path)):
+        build_state.rows_processed = row_ordinal + 1
         annotations = annotate_row_candidates(row, row_ordinal=row_ordinal, settings=settings)
         for annotation in annotations:
             build_state.candidates += 1
@@ -229,7 +261,20 @@ def iter_index_chunks_from_raw_artifact(
                 build_state.duplicate_child += 1
             assert build_state.role_counts is not None
             build_state.role_counts[annotation.role] += 1
-        yield from build_chunks_for_row(row, row_ordinal, annotations, settings, build_state)
+        chunks = build_chunks_for_row(row, row_ordinal, annotations, settings, build_state)
+        build_state.chunks_emitted += len(chunks)
+        if ticker is not None:
+            ticker.tick(
+                row_ordinal + 1,
+                chunks=build_state.chunks_emitted,
+                candidates=build_state.candidates,
+                tiny=build_state.tiny_candidates,
+                tiny_suppressed=build_state.tiny_suppressed,
+                duplicate_child=build_state.duplicate_child,
+                boilerplate=build_state.boilerplate,
+                context_expanded=build_state.context_expanded,
+            )
+        yield from chunks
 
 
 def annotate_row_candidates(

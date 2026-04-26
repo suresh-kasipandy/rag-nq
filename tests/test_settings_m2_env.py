@@ -18,6 +18,9 @@ def test_from_env_max_passages_and_embedding_batch(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("RAG_BM25_K1", "1.2")
     monkeypatch.setenv("RAG_BM25_B", "0.8")
     monkeypatch.setenv("RAG_BM25_EPSILON", "0.3")
+    monkeypatch.setenv("RAG_PROGRESS_LOG_EVERY_RECORDS", "5000")
+    monkeypatch.setenv("RAG_PROGRESS_LOG_EVERY_BATCHES", "250")
+    monkeypatch.setenv("RAG_PROGRESS_LOG_EVERY_SECONDS", "30.5")
     s = Settings.from_env()
     assert s.max_passages == 100
     assert s.embedding_batch_size == 32
@@ -31,3 +34,6 @@ def test_from_env_max_passages_and_embedding_batch(monkeypatch: pytest.MonkeyPat
     assert s.bm25_k1 == pytest.approx(1.2)
     assert s.bm25_b == pytest.approx(0.8)
     assert s.bm25_epsilon == pytest.approx(0.3)
+    assert s.progress_log_every_records == 5000
+    assert s.progress_log_every_batches == 250
+    assert s.progress_log_every_seconds == pytest.approx(30.5)

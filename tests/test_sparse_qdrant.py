@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -203,7 +204,9 @@ def _write_sparse_fixture(path: Path, ids: list[str]) -> None:
             handle.write("\n")
 
 
-def test_sparse_indexer_uses_chunk_id_for_index_chunks(tmp_path: Path) -> None:
+def test_sparse_indexer_uses_chunk_id_for_index_chunks(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     chunk = IndexChunk(
         chunk_id=str(uuid.uuid4()),
         group_id="group-1",
@@ -220,14 +223,32 @@ def test_sparse_indexer_uses_chunk_id_for_index_chunks(tmp_path: Path) -> None:
         sparse_upsert_batch_size=1,
         qdrant_sparse_vector_name="sparse",
         qdrant_collection="nq_passages",
+        progress_log_every_records=1,
+        progress_log_every_batches=1,
     )
 
+    caplog.set_level(logging.INFO)
     client = FakeSparseClient()
     indexer = SparseQdrantIndexer(settings=settings, client=client)
     result = indexer.build_from_jsonl(chunks)
 
     assert result.points_updated == 1
     assert client.updated_ids == [[chunk.chunk_id]]
+    progress_records = [
+        (getattr(record, "stage", None), record.getMessage()) for record in caplog.records
+    ]
+    assert any(
+        stage == "sparse_pass1" and message.startswith("start records=0 ")
+        for stage, message in progress_records
+    )
+    assert any(
+        stage == "sparse_pass1" and message.startswith("complete records=1 ")
+        for stage, message in progress_records
+    )
+    assert any(
+        stage == "sparse_pass2" and message.startswith("progress batches=1/1")
+        for stage, message in progress_records
+    )
 
 
 def test_sparse_resume_uses_checkpoint_after_partial_failure(tmp_path: Path) -> None:

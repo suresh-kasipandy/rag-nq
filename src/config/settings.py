@@ -61,6 +61,9 @@ class Settings(BaseModel):
     chunk_target_tokens: int = Field(default=160, ge=1)
     chunk_max_tokens: int = Field(default=300, ge=1)
     chunk_context_text_token_cap: int = Field(default=400, ge=1)
+    progress_log_every_records: int = Field(default=10_000, ge=1)
+    progress_log_every_batches: int = Field(default=500, ge=1)
+    progress_log_every_seconds: float = Field(default=60.0, gt=0)
     hybrid_rrf_k: int = Field(default=60, ge=1)
     hybrid_dense_weight: float = Field(default=1.0, ge=0)
     hybrid_sparse_weight: float = Field(default=1.0, ge=0)
@@ -188,6 +191,12 @@ class Settings(BaseModel):
             overrides["chunk_max_tokens"] = int(value)
         if value := os.getenv("RAG_CHUNK_CONTEXT_TEXT_TOKEN_CAP"):
             overrides["chunk_context_text_token_cap"] = int(value)
+        if value := os.getenv("RAG_PROGRESS_LOG_EVERY_RECORDS"):
+            overrides["progress_log_every_records"] = int(value)
+        if value := os.getenv("RAG_PROGRESS_LOG_EVERY_BATCHES"):
+            overrides["progress_log_every_batches"] = int(value)
+        if value := os.getenv("RAG_PROGRESS_LOG_EVERY_SECONDS"):
+            overrides["progress_log_every_seconds"] = float(value)
         if value := os.getenv("RAG_HYBRID_RRF_K"):
             overrides["hybrid_rrf_k"] = int(value)
         if value := os.getenv("RAG_HYBRID_DENSE_WEIGHT"):

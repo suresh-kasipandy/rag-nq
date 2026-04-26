@@ -24,6 +24,7 @@ from src.ingestion.models import (
     Passage,
     SparseIndexManifest,
 )
+from src.observability.progress import ProgressTicker
 from src.retrieval.sparse_index import (
     SPARSE_ANALYZER_VERSION,
     SparseAnalyzerName,
@@ -108,6 +109,7 @@ def _pass1_scan(
     *,
     max_passages: int | None,
     analyzer: SparseAnalyzerName = "regex_stem_stop",
+    ticker: ProgressTicker | None = None,
 ) -> _Pass1State:
     """Stream silver once: document frequencies and stable term → id map (first-seen order)."""
 
@@ -131,6 +133,8 @@ def _pass1_scan(
                 if term not in term_to_id:
                     term_to_id[term] = len(term_to_id)
                 nd[term] = nd.get(term, 0) + 1
+            if ticker is not None:
+                ticker.tick(doc_count, total_tokens=total_tokens, vocabulary_size=len(term_to_id))
 
     return _Pass1State(
         document_count=doc_count,
@@ -145,6 +149,7 @@ def _scan_document_frequencies(
     *,
     max_passages: int | None,
     analyzer: SparseAnalyzerName = "regex_stem_stop",
+    ticker: ProgressTicker | None = None,
 ) -> tuple[int, int, dict[str, int]]:
     """Stream silver once and compute doc_count/total_tokens/nd without rebuilding term ids."""
 
@@ -164,6 +169,8 @@ def _scan_document_frequencies(
             total_tokens += len(tokens)
             for term in set(tokens):
                 nd[term] = nd.get(term, 0) + 1
+            if ticker is not None:
+                ticker.tick(doc_count, total_tokens=total_tokens, vocabulary_size=len(nd))
     return doc_count, total_tokens, nd
 
 
@@ -553,10 +560,29 @@ class SparseQdrantIndexer:
                 sparse_analyzer=self._settings.sparse_analyzer,
             )
         except RuntimeError:
+            pass1_ticker = ProgressTicker(
+                logger=LOGGER,
+                stage="sparse_pass1",
+                label="records",
+                total=max_passages,
+                every_items=self._settings.progress_log_every_records,
+                every_seconds=self._settings.progress_log_every_seconds,
+            )
+            pass1_ticker.start(
+                input=jsonl_path,
+                analyzer=self._settings.sparse_analyzer,
+                analyzer_version=SPARSE_ANALYZER_VERSION,
+            )
             p1 = _pass1_scan(
                 jsonl_path,
                 max_passages=max_passages,
                 analyzer=self._settings.sparse_analyzer,
+                ticker=pass1_ticker,
+            )
+            pass1_ticker.finish(
+                p1.document_count,
+                total_tokens=p1.total_tokens,
+                vocabulary_size=len(p1.term_to_id),
             )
             _write_sparse_pass1_artifact(
                 path=self._settings.sparse_pass1_path,
@@ -570,10 +596,31 @@ class SparseQdrantIndexer:
                 "reusing sparse pass1 artifact at %s",
                 self._settings.sparse_pass1_path,
             )
+            pass1_ticker = ProgressTicker(
+                logger=LOGGER,
+                stage="sparse_pass1",
+                label="records",
+                total=pass1_data.document_count,
+                every_items=self._settings.progress_log_every_records,
+                every_seconds=self._settings.progress_log_every_seconds,
+            )
+            pass1_ticker.start(
+                input=jsonl_path,
+                analyzer=self._settings.sparse_analyzer,
+                analyzer_version=SPARSE_ANALYZER_VERSION,
+                reused_artifact=self._settings.sparse_pass1_path,
+            )
             doc_count, total_tokens, nd = _scan_document_frequencies(
                 jsonl_path,
                 max_passages=max_passages,
                 analyzer=self._settings.sparse_analyzer,
+                ticker=pass1_ticker,
+            )
+            pass1_ticker.finish(
+                doc_count,
+                total_tokens=total_tokens,
+                vocabulary_size=len(pass1_data.term_to_id),
+                reused_artifact=self._settings.sparse_pass1_path,
             )
             if doc_count != pass1_data.document_count or total_tokens != pass1_data.total_tokens:
                 raise RuntimeError(
@@ -631,6 +678,33 @@ class SparseQdrantIndexer:
         points_updated = 0
         completed_non_empty = checkpoint.indexed_count
         seen_non_empty = 0
+        empty_sparse_vectors = 0
+        batches_completed = 0
+        total_records = p1.document_count
+        remaining_records = max(total_records - checkpoint.indexed_count, 0)
+        total_batches = (
+            math.ceil(remaining_records / self._settings.sparse_upsert_batch_size)
+            if remaining_records
+            else 0
+        )
+        pass2_ticker = ProgressTicker(
+            logger=LOGGER,
+            stage="sparse_pass2",
+            label="batches",
+            total=total_batches,
+            every_items=self._settings.progress_log_every_batches,
+            every_seconds=self._settings.progress_log_every_seconds,
+        )
+        pass2_ticker.start(
+            input=jsonl_path,
+            collection=self._settings.qdrant_collection,
+            sparse_vector_name=sparse_name,
+            batch_size=self._settings.sparse_upsert_batch_size,
+            workers=self._settings.sparse_workers,
+            write_concurrency=self._settings.sparse_write_concurrency,
+            resume_count=checkpoint.indexed_count,
+            records_total=total_records,
+        )
         pending_writes: list[_PendingWrite] = []
 
         def _compute_point(passage: IndexChunk | Passage) -> Any | None:
@@ -652,11 +726,12 @@ class SparseQdrantIndexer:
             )
 
         def _wait_one_pending() -> None:
-            nonlocal completed_non_empty, points_updated
+            nonlocal batches_completed, completed_non_empty, points_updated
             pending = pending_writes.pop(0)
             pending.future.result()
             completed_non_empty += pending.non_empty_count
             points_updated += pending.point_count
+            batches_completed += 1
             _write_sparse_checkpoint(
                 path=checkpoint_path,
                 silver_path=jsonl_path,
@@ -670,10 +745,12 @@ class SparseQdrantIndexer:
                 sparse_analyzer=self._settings.sparse_analyzer,
                 indexed_count=completed_non_empty,
             )
-            LOGGER.info(
-                "sparse_qdrant_index updated=%s batch_flushed",
-                points_updated,
-                extra={"stage": "sparse_qdrant_index"},
+            pass2_ticker.tick(
+                batches_completed,
+                records_indexed=completed_non_empty,
+                records_total=total_records,
+                points_updated=points_updated,
+                empty_sparse_vectors=empty_sparse_vectors,
             )
 
         def _submit_batch(
@@ -682,9 +759,11 @@ class SparseQdrantIndexer:
             compute_executor: ThreadPoolExecutor,
             writer_executor: ThreadPoolExecutor,
         ) -> None:
+            nonlocal empty_sparse_vectors
             if not passages:
                 return
             points = [p for p in compute_executor.map(_compute_point, passages) if p is not None]
+            empty_sparse_vectors += len(passages) - len(points)
 
             def _writer_job() -> None:
                 if not points:
@@ -746,6 +825,15 @@ class SparseQdrantIndexer:
             points_updated=points_updated,
         )
         self.write_manifest(jsonl_path=jsonl_path, pass1=p1, idf=idf, result=result)
+        pass2_ticker.finish(
+            batches_completed,
+            records_indexed=completed_non_empty,
+            records_total=total_records,
+            points_updated=points_updated,
+            empty_sparse_vectors=empty_sparse_vectors,
+            manifest=self._settings.sparse_manifest_path,
+            pass1_artifact=self._settings.sparse_pass1_path,
+        )
         return result
 
     def write_manifest(

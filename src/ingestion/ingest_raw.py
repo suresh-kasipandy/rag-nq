@@ -6,12 +6,13 @@ import argparse
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from src.config.settings import Settings
 from src.ingestion.models import RAW_DATASET_SCHEMA_VERSION, RawDatasetManifest
 from src.observability.logging_setup import get_stage_logger, setup_logging
+from src.observability.progress import ProgressTicker
 
 LOGGER = get_stage_logger(__name__)
 
@@ -88,15 +89,33 @@ def run_raw_ingest(settings: Settings, *, force: bool = False) -> tuple[RawDatas
     from src.ingestion.nq_loader import _iter_hf_rows  # local import avoids eager HF dependency
 
     tmp_raw = settings.raw_dataset_path.with_suffix(settings.raw_dataset_path.suffix + ".tmp")
-    tmp_manifest = settings.raw_manifest_path.with_suffix(settings.raw_manifest_path.suffix + ".tmp")
+    tmp_manifest = settings.raw_manifest_path.with_suffix(
+        settings.raw_manifest_path.suffix + ".tmp"
+    )
     settings.output_dir.mkdir(parents=True, exist_ok=True)
 
+    ticker = ProgressTicker(
+        logger=LOGGER,
+        stage="ingest_raw",
+        label="rows",
+        total=settings.max_passages,
+        every_items=settings.progress_log_every_records,
+        every_seconds=settings.progress_log_every_seconds,
+    )
+    ticker.start(
+        dataset=settings.dataset_name,
+        split=settings.dataset_split,
+        output=settings.raw_dataset_path,
+        streaming=settings.dataset_streaming,
+        max_passages=settings.max_passages,
+    )
     row_count = 0
     with tmp_raw.open("w", encoding="utf-8") as handle:
         for row in _iter_hf_rows(settings):
             handle.write(json.dumps(row))
             handle.write("\n")
             row_count += 1
+            ticker.tick(row_count, output=settings.raw_dataset_path)
             if settings.max_passages is not None and row_count >= settings.max_passages:
                 break
         handle.flush()
@@ -110,7 +129,7 @@ def run_raw_ingest(settings: Settings, *, force: bool = False) -> tuple[RawDatas
         dataset_split=settings.dataset_split,
         max_passages=settings.max_passages,
         row_count=row_count,
-        created_at_utc=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        created_at_utc=datetime.now(UTC).replace(microsecond=0).isoformat(),
     )
     with tmp_manifest.open("w", encoding="utf-8") as handle:
         handle.write(manifest.model_dump_json(indent=2, exclude_none=True))
@@ -119,7 +138,7 @@ def run_raw_ingest(settings: Settings, *, force: bool = False) -> tuple[RawDatas
         os.fsync(handle.fileno())
     _replace_atomic(tmp_manifest, settings.raw_manifest_path)
 
-    LOGGER.info("wrote raw dataset (%s rows)", row_count, extra={"stage": "persist"})
+    ticker.finish(row_count, output=settings.raw_dataset_path, manifest=settings.raw_manifest_path)
     return manifest, False
 
 

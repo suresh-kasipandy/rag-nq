@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 from src.config.settings import Settings
+from src.ingestion import ingest_silver
 from src.ingestion.ingest_raw import (
     load_raw_manifest,
     run_raw_ingest,
@@ -24,7 +26,6 @@ from src.ingestion.models import (
     Passage,
     RawDatasetManifest,
 )
-from src.ingestion import ingest_silver
 
 
 def test_count_jsonl_lines_skips_blanks(tmp_path: Path) -> None:
@@ -33,7 +34,9 @@ def test_count_jsonl_lines_skips_blanks(tmp_path: Path) -> None:
     assert count_jsonl_lines(path) == 2
 
 
-def test_should_skip_ingest_when_manifest_matches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_should_skip_ingest_when_manifest_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     out = tmp_path / "out"
     out.mkdir()
     settings = Settings(
@@ -99,16 +102,27 @@ def test_should_skip_raw_ingest_when_manifest_matches(tmp_path: Path) -> None:
     assert should_skip_raw_ingest(settings, force=False) is True
 
 
-def test_run_raw_ingest_writes_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_raw_ingest_writes_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     out = tmp_path / "out"
     out.mkdir()
-    settings = Settings(output_dir=out, dataset_name="ds", dataset_split="train", max_passages=None)
+    settings = Settings(
+        output_dir=out,
+        dataset_name="ds",
+        dataset_split="train",
+        max_passages=None,
+        progress_log_every_records=1,
+    )
 
     def fake_rows(_settings: Settings):
         yield {"id": "x", "candidates": ["A"]}
         yield {"id": "y", "candidates": ["B"]}
 
     monkeypatch.setattr("src.ingestion.nq_loader._iter_hf_rows", fake_rows)
+    caplog.set_level(logging.INFO)
     manifest, skipped = run_raw_ingest(settings, force=True)
     assert skipped is False
     assert manifest.row_count == 2
@@ -116,9 +130,15 @@ def test_run_raw_ingest_writes_artifacts(tmp_path: Path, monkeypatch: pytest.Mon
     loaded = load_raw_manifest(settings.raw_manifest_path)
     assert loaded is not None
     assert loaded.row_count == 2
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("[ingest_raw] start rows=0 " in message for message in messages)
+    assert any("[ingest_raw] progress rows=1 " in message for message in messages)
+    assert any("[ingest_raw] complete rows=2 " in message for message in messages)
 
 
-def test_run_ingest_streams_from_raw_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_ingest_streams_from_raw_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     out = tmp_path / "out"
     out.mkdir()
     settings = Settings(output_dir=out, dataset_name="ds", dataset_split="train", max_passages=3)
@@ -151,4 +171,5 @@ def test_run_ingest_streams_from_raw_artifact(tmp_path: Path, monkeypatch: pytes
     loaded = load_ingest_manifest(settings.ingest_manifest_path)
     assert loaded is not None
     assert loaded.line_count == 3
-    assert json.loads(settings.passages_path.read_text(encoding="utf-8").splitlines()[0])["passage_id"] == "id0"
+    first_line = settings.passages_path.read_text(encoding="utf-8").splitlines()[0]
+    assert json.loads(first_line)["passage_id"] == "id0"

@@ -95,6 +95,7 @@ Then set `RAG_QDRANT_COLLECTION=nq_passages` (or rely on the project default), r
 - `RAG_MAX_PASSAGES`, `RAG_FORCE_INGEST`, `RAG_FORCE_RAW_INGEST`, `RAG_EMBEDDING_BATCH_SIZE`, `RAG_DENSE_READ_BATCH_LINES`
 - Chunking: `RAG_INDEX_CHUNKS_JSONL`, `RAG_CHUNK_MANIFEST_FILE`, `RAG_CHUNK_MIN_TOKENS_SOFT`, `RAG_CHUNK_MIN_TOKENS_HARD`, `RAG_CHUNK_TARGET_TOKENS`, `RAG_CHUNK_MAX_TOKENS`, `RAG_CHUNK_CONTEXT_TEXT_TOKEN_CAP`
 - Sparse / BM25: `RAG_QDRANT_SPARSE_VECTOR_NAME` (default `sparse`), `RAG_SPARSE_ANALYZER` (default `regex_stem_stop`), `RAG_SPARSE_UPSERT_BATCH_SIZE`, `RAG_SPARSE_WORKERS`, `RAG_SPARSE_WRITE_CONCURRENCY`, `RAG_SPARSE_CHECKPOINT_FILE`, `RAG_BM25_K1`, `RAG_BM25_B`, `RAG_BM25_EPSILON`
+- Progress logging: `RAG_PROGRESS_LOG_EVERY_RECORDS` (default `10000`), `RAG_PROGRESS_LOG_EVERY_BATCHES` (default `500`), `RAG_PROGRESS_LOG_EVERY_SECONDS` (default `60.0`)
 
 `RAG_MAX_PASSAGES` now gates raw/chunk output size and dense/sparse indexing scope, which is useful for smoke tests against larger artifacts.
 
@@ -105,6 +106,7 @@ Then set `RAG_QDRANT_COLLECTION=nq_passages` (or rely on the project default), r
 - Dense upsert uses a minimal retry policy (small fixed attempts + exponential backoff) for transient timeout/overload cases.
 - Dense indexing writes a minimal checkpoint at `artifacts/dense_checkpoint.json` after successful upsert chunks and resumes from it on the next run if inputs still match.
 - Sparse indexing also checkpoints progress at `artifacts/sparse_checkpoint.json`; default concurrency is conservative (`RAG_SPARSE_WORKERS=1`, `RAG_SPARSE_WRITE_CONCURRENCY=1`) so behavior stays equivalent unless you opt in to higher pass-2 concurrency.
+- Long-running raw ingest, chunk ingest, dense indexing, and sparse indexing emit throttled start/progress/complete logs. Defaults avoid per-batch spam; lower the progress env vars for smoke tests or debugging.
 - **Legacy:** `src.retrieval.sparse_index.SparseIndexer` + `artifacts/bm25_index.pkl` remain for tests and historical Milestone 1–2 behavior; the default CLI path is Qdrant sparse (above).
 
 ## Milestone 1.5 — local Qdrant

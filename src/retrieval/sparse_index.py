@@ -3,13 +3,43 @@
 from __future__ import annotations
 
 import pickle
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from src.ingestion.models import Passage
 from src.ingestion.nq_loader import tokenized_corpus
+
+SparseAnalyzerName = Literal["whitespace", "regex", "regex_stem", "regex_stem_stop"]
+SPARSE_ANALYZER_VERSION = "1"
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?")
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "was",
+    "were",
+    "with",
+}
 
 
 @dataclass(slots=True)
@@ -38,8 +68,42 @@ class SparseCorpusStats:
         return self.total_tokens / self.document_count
 
 
-def _tokenize_passage_text(text: str) -> list[str]:
-    return text.lower().split()
+def _tokenize_passage_text(
+    text: str, *, analyzer: SparseAnalyzerName = "regex_stem_stop"
+) -> list[str]:
+    """Analyze text for sparse lexical retrieval."""
+
+    if analyzer == "whitespace":
+        return text.lower().split()
+    tokens = [match.group(0).casefold() for match in _TOKEN_RE.finditer(text)]
+    if analyzer in {"regex_stem", "regex_stem_stop"}:
+        tokens = [_stem_token(token) for token in tokens]
+    if analyzer == "regex_stem_stop":
+        tokens = [token for token in tokens if token not in _STOPWORDS]
+    return [token for token in tokens if token]
+
+
+def _stem_token(token: str) -> str:
+    """Small deterministic stemmer for sparse retrieval.
+
+    This is intentionally conservative; it captures common English suffix variants without
+    changing short/entity-like tokens aggressively.
+    """
+
+    if len(token) <= 4 or token.isdigit():
+        return token
+    for suffix, replacement in (
+        ("ies", "y"),
+        ("ing", ""),
+        ("edly", ""),
+        ("ed", ""),
+        ("ers", "er"),
+        ("es", ""),
+        ("s", ""),
+    ):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            return token[: -len(suffix)] + replacement
+    return token
 
 
 def compute_sparse_corpus_stats_pass1(jsonl_path: Path) -> SparseCorpusStats:
@@ -113,7 +177,7 @@ class SparseIndexer:
     def build_from_jsonl_two_pass(
         cls, jsonl_path: Path
     ) -> tuple[SparseIndexer, SparseBuildResult, SparseCorpusStats]:
-        """Two-pass silver read: pass 1 global stats, pass 2 materialize token lists for ``BM25Okapi``.
+        """Two-pass silver read with global stats before materializing ``BM25Okapi`` tokens.
 
         Pass 2 still loads all token lists into RAM because ``rank_bm25.BM25Okapi`` expects the
         full corpus in memory. Pass 1 enables streaming validation of global statistics and tests

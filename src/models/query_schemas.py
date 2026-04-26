@@ -19,8 +19,12 @@ class PassageHit(BaseModel):
     """A retrieved passage with optional per-retriever scores and ranks."""
 
     passage_id: str = Field(min_length=1)
+    chunk_id: str | None = Field(default=None, min_length=1)
     text: str = Field(min_length=1)
+    context_text: str | None = None
     source: str | None = None
+    title: str | None = None
+    document_url: str | None = None
     dense_score: float | None = None
     dense_rank: int | None = Field(default=None, ge=1)
     sparse_score: float | None = None

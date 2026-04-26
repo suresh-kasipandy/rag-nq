@@ -13,33 +13,47 @@ Lean RAG on `sentence-transformers/NQ-retrieval`: ingestion, dense/sparse indexe
 
 Optional environment variables use the `RAG_` prefix. See [.env.example](.env.example).
 
-## Milestone 2 — staged indexing (silver → dense → sparse)
+## Milestone 3.6 — staged indexing (raw → chunks → dense → sparse)
 
-**Goal:** Hugging Face is only used during **ingest**; dense/sparse read **`artifacts/passages.jsonl`** (the silver contract). Ingest skips work when `ingest_manifest.json` matches config and line counts.
+**Goal:** Hugging Face is only used during **raw ingest**; downstream stages read local artifacts. Ingest now keeps:
+- `artifacts/raw_dataset.jsonl` + `artifacts/raw_ingest_manifest.json` (raw row snapshot)
+- `artifacts/index_chunks.jsonl` + `artifacts/chunk_manifest.json` (chunked index corpus)
+
+When manifests match current settings, ingest reuses local artifacts and avoids network.
 
 **Commands**
 
-1. **Ingest** (HF / Hub cache → `artifacts/passages.jsonl` + `ingest_manifest.json`):
+1. **Raw ingest** (HF / Hub cache → `artifacts/raw_dataset.jsonl` + `raw_ingest_manifest.json`):
 
    ```bash
-   python -m src.scripts.ingest_passages
+   python -m src.ingestion.ingest_raw
+   # force re-download even when raw manifest matches
+   python -m src.ingestion.ingest_raw --force
    ```
 
-2. **Dense** (chunked read of silver → Qdrant; **requires** silver unless you opt in to HF):
+2. **Chunk ingest** (raw snapshot → `index_chunks.jsonl`):
+
+   ```bash
+   python -m src.scripts.ingest_chunks
+   # force rebuild even when manifests match
+   python -m src.scripts.ingest_chunks --force
+   ```
+
+3. **Dense** (stream `index_chunks.jsonl` → Qdrant; **requires** chunks unless you opt in to HF):
 
    ```bash
    python -m src.scripts.index_dense
-   # or: pull from HF into silver first, then dense
+   # or: refresh raw data, rebuild chunks, then dense
    python -m src.scripts.index_dense --from-hf
    ```
 
-3. **Sparse** (Milestone 2.2: two-pass **streaming** read of silver → BM25-style sparse vectors on Qdrant via `update_vectors`; **no** full-corpus `rank_bm25` token materialization; writes `artifacts/sparse_index_manifest.json`). **Requires** Qdrant and an existing **dense** collection created with this repo version (collection includes a named sparse vector slot next to `dense`). Run `index_dense` before `index_sparse`.
+4. **Sparse** (two-pass **streaming** read of chunks → BM25-style sparse vectors on Qdrant via `update_vectors`; **no** full-corpus `rank_bm25` token materialization; writes `artifacts/sparse_index_manifest.json`). **Requires** Qdrant and an existing **dense** collection created with this repo version (collection includes a named sparse vector slot next to `dense`). Run `index_dense` before `index_sparse`.
 
    ```bash
    python -m src.scripts.index_sparse
    ```
 
-   Sparse indexing writes `artifacts/sparse_checkpoint.json` after each successful sparse flush and resumes from it on the next run when silver path / collection / sparse name / BM25 params / max_passages / sparse batch size still match. Delete that checkpoint to force a full sparse rebuild.
+   Sparse indexing writes `artifacts/sparse_checkpoint.json` after each successful sparse flush and resumes from it on the next run when chunk path / collection / sparse name / analyzer / BM25 params / max_passages / sparse batch size still match. Delete that checkpoint to force a full sparse rebuild.
 
 ### Migrating from `nq_passages_dense` to `nq_passages` (one-time)
 
@@ -59,20 +73,30 @@ Then set `RAG_QDRANT_COLLECTION=nq_passages` (or rely on the project default), r
 
 **Checkpoint:** `artifacts/dense_checkpoint.json` stores `collection_name`. If a dense rebuild was mid-flight against the old collection name, delete or edit that checkpoint before resuming `index_dense` against the new collection.
 
-4. **All-in-one** (same pipeline as separate stages; honors skip-if-fresh ingest):
+5. **All-in-one** (same pipeline as separate stages; honors skip-if-fresh chunk ingest):
 
    ```bash
    python -m src.scripts.build_indexes
    ```
 
+6. **Chunking strategy analysis** (raw rows → strategy comparison report):
+
+   ```bash
+   python -m src.scripts.analyze_chunking_strategies --max-rows 1000 --max-queries 100
+   ```
+
+   This writes `artifacts/chunking_evaluation_report.md` and
+   `artifacts/chunking_evaluation_report.json`. The analysis uses NQ `long_answers` only as
+   evaluation labels to compare candidate, row, fixed-window, parent/deduped, minimum-context,
+   and parent-child strategies.
+
 **Env (see `.env.example`)**
 
-- `RAG_MAX_PASSAGES`, `RAG_FORCE_INGEST`, `RAG_EMBEDDING_BATCH_SIZE`, `RAG_DENSE_READ_BATCH_LINES`
-- Sparse / BM25 (Milestone 2.2): `RAG_QDRANT_SPARSE_VECTOR_NAME` (default `sparse`), `RAG_SPARSE_UPSERT_BATCH_SIZE`, `RAG_SPARSE_WORKERS`, `RAG_SPARSE_WRITE_CONCURRENCY`, `RAG_SPARSE_CHECKPOINT_FILE`, `RAG_BM25_K1`, `RAG_BM25_B`, `RAG_BM25_EPSILON`
+- `RAG_MAX_PASSAGES`, `RAG_FORCE_INGEST`, `RAG_FORCE_RAW_INGEST`, `RAG_EMBEDDING_BATCH_SIZE`, `RAG_DENSE_READ_BATCH_LINES`
+- Chunking: `RAG_INDEX_CHUNKS_JSONL`, `RAG_CHUNK_MANIFEST_FILE`, `RAG_CHUNK_MIN_TOKENS_SOFT`, `RAG_CHUNK_MIN_TOKENS_HARD`, `RAG_CHUNK_TARGET_TOKENS`, `RAG_CHUNK_MAX_TOKENS`, `RAG_CHUNK_CONTEXT_TEXT_TOKEN_CAP`
+- Sparse / BM25: `RAG_QDRANT_SPARSE_VECTOR_NAME` (default `sparse`), `RAG_SPARSE_ANALYZER` (default `regex_stem_stop`), `RAG_SPARSE_UPSERT_BATCH_SIZE`, `RAG_SPARSE_WORKERS`, `RAG_SPARSE_WRITE_CONCURRENCY`, `RAG_SPARSE_CHECKPOINT_FILE`, `RAG_BM25_K1`, `RAG_BM25_B`, `RAG_BM25_EPSILON`
 
-`RAG_MAX_PASSAGES` now gates both:
-- ingest output size (HF → silver line count), and
-- dense indexing scope (silver → Qdrant points), which is useful for smoke tests against a larger existing silver file.
+`RAG_MAX_PASSAGES` now gates raw/chunk output size and dense/sparse indexing scope, which is useful for smoke tests against larger artifacts.
 
 **Notes**
 
@@ -106,10 +130,10 @@ Then set `RAG_QDRANT_COLLECTION=nq_passages` (or rely on the project default), r
 
 To stop Qdrant without deleting stored vectors: `docker compose stop`. To remove the volume as well: `docker compose down -v`.
 
-Ingestion follows the HuggingFace `sentence-transformers/NQ-retrieval` layout: each row’s `candidates` list is expanded into one passage per non-empty candidate, with deterministic UUID passage IDs and optional metadata (`title`, `question`, `passage_types` per candidate, `document_url`, `long_answers`).
+Chunk ingestion follows the HuggingFace `sentence-transformers/NQ-retrieval` layout: each row’s `candidates` list is preprocessed, role-tagged, merged into structure-aware chunks, and emitted with deterministic `chunk_id` values plus metadata (`title`, `question`, `passage_types`, `document_url`, `long_answers`, and bounded `context_text`).
 
 ## Commands
 
-- **Staged (Milestone 2):** `ingest_passages` → `index_dense` → `index_sparse`, or `build_indexes` for one chain (see Milestone 2 above).
+- **Staged (Milestone 3.6):** `ingest_chunks` → `index_dense` → `index_sparse`, or `build_indexes` for one chain (see Milestone 3.6 above).
 - Doctor: `python -m src.scripts.doctor`
 - Tests (from repo root): `pytest rag-nq-showcase/tests`

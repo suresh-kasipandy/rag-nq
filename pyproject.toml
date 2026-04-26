@@ -16,6 +16,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "ipykernel>=7.2.0",
     "pytest>=8.2.0",
     "ruff>=0.6.0",
 ]
@@ -23,6 +24,9 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "live_network: opt-in tests that hit external network services (disabled by default)",
+]
 
 [tool.ruff]
 line-length = 100

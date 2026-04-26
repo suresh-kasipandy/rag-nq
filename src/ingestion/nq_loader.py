@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
+from pathlib import Path
 
+import json
+from pydantic import BaseModel, ConfigDict, Field
 from tqdm import tqdm
 
 from src.config.settings import Settings
@@ -16,6 +19,21 @@ from src.observability.logging_setup import quiet_http_clients
 _PASSAGE_ID_NAMESPACE = uuid.UUID("018f0884-e1c7-7e4f-a9c2-0f6b2a8d4e10")
 
 
+class _HFRowModel(BaseModel):
+    """Validation boundary used only for first-load rows from Hugging Face."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: object | None = None
+    text: object | None = None
+    title: object | None = None
+    question: object | None = None
+    candidates: list[object] | None = None
+    passage_types: list[object] | None = None
+    long_answers: object | None = None
+    document_url: object | None = None
+
+
 def iter_nq_passages(settings: Settings) -> Iterator[Passage]:
     """Yield passages from the configured NQ-retrieval split without materializing the full list.
 
@@ -23,31 +41,39 @@ def iter_nq_passages(settings: Settings) -> Iterator[Passage]:
     Milestone 2 silver writes and bounded-memory ingest.
     """
 
-    with quiet_http_clients():
-        raw_split = _load_dataset(
-            settings.dataset_name,
-            settings.dataset_split,
-            streaming=settings.dataset_streaming,
-        )
-        row_iter: Iterable[object] = raw_split
-        if _ingest_progress_enabled(settings):
-            row_total = _try_split_num_examples(settings.dataset_name, settings.dataset_split)
-            row_iter = tqdm(
-                raw_split,
-                desc="Dataset rows",
-                unit="row",
-                total=row_total,
-                mininterval=0.5,
-            )
+    yield from iter_nq_passages_from_rows(_iter_hf_rows(settings), settings=settings)
 
-        yielded = 0
-        for row_ordinal, row in enumerate(row_iter):
-            row_mapping = _as_mapping(row)
-            for passage in _passages_from_row(row_mapping, row_ordinal, settings):
-                yield passage
-                yielded += 1
-                if settings.max_passages is not None and yielded >= settings.max_passages:
-                    return
+
+def iter_nq_passages_from_raw_artifact(settings: Settings) -> Iterator[Passage]:
+    """Yield passages from local raw dataset JSONL artifact."""
+
+    rows = iter_raw_rows(settings.raw_dataset_path)
+    yield from iter_nq_passages_from_rows(rows, settings=settings)
+
+
+def iter_nq_passages_from_rows(
+    rows: Iterable[Mapping[str, object]], *, settings: Settings
+) -> Iterator[Passage]:
+    """Expand row stream into deterministic passage stream."""
+
+    row_iter: Iterable[Mapping[str, object]] = rows
+    if _ingest_progress_enabled(settings):
+        row_total = _try_split_num_examples(settings.dataset_name, settings.dataset_split)
+        row_iter = tqdm(
+            rows,
+            desc="Dataset rows",
+            unit="row",
+            total=row_total,
+            mininterval=0.5,
+        )
+
+    yielded = 0
+    for row_ordinal, row in enumerate(row_iter):
+        for passage in _passages_from_row(row, row_ordinal, settings):
+            yield passage
+            yielded += 1
+            if settings.max_passages is not None and yielded >= settings.max_passages:
+                return
 
 
 def load_nq_passages(settings: Settings) -> list[Passage]:
@@ -97,6 +123,35 @@ def _as_mapping(row: object) -> Mapping[str, object]:
     if isinstance(row, Mapping):
         return row
     raise TypeError(f"Dataset row must be a mapping, got {type(row)!r}")
+
+
+def iter_raw_rows(path: Path) -> Iterator[Mapping[str, object]]:
+    """Yield validated row mappings from local raw JSONL artifact."""
+
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError("Raw dataset JSONL line must be a JSON object.")
+            yield {str(k): v for k, v in payload.items()}
+
+
+def _iter_hf_rows(settings: Settings) -> Iterator[Mapping[str, object]]:
+    """Load and validate raw rows from Hugging Face stream."""
+
+    with quiet_http_clients():
+        raw_split = _load_dataset(
+            settings.dataset_name,
+            settings.dataset_split,
+            streaming=settings.dataset_streaming,
+        )
+        for row in raw_split:
+            mapping = _as_mapping(row)
+            validated = _HFRowModel.model_validate(dict(mapping))
+            yield validated.model_dump()
 
 
 def _passages_from_row(

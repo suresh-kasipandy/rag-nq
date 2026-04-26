@@ -14,6 +14,7 @@ def test_from_env_max_passages_and_embedding_batch(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("RAG_SPARSE_WRITE_CONCURRENCY", "2")
     monkeypatch.setenv("RAG_SPARSE_CHECKPOINT_FILE", "checkpoint_sparse.json")
     monkeypatch.setenv("RAG_QDRANT_SPARSE_VECTOR_NAME", "sparse_x")
+    monkeypatch.setenv("RAG_QDRANT_RETRIEVAL_TIMEOUT_SECONDS", "22.5")
     monkeypatch.setenv("RAG_BM25_K1", "1.2")
     monkeypatch.setenv("RAG_BM25_B", "0.8")
     monkeypatch.setenv("RAG_BM25_EPSILON", "0.3")
@@ -26,6 +27,7 @@ def test_from_env_max_passages_and_embedding_batch(monkeypatch: pytest.MonkeyPat
     assert s.sparse_write_concurrency == 2
     assert s.sparse_checkpoint_file == "checkpoint_sparse.json"
     assert s.qdrant_sparse_vector_name == "sparse_x"
+    assert s.qdrant_retrieval_timeout_seconds == pytest.approx(22.5)
     assert s.bm25_k1 == pytest.approx(1.2)
     assert s.bm25_b == pytest.approx(0.8)
     assert s.bm25_epsilon == pytest.approx(0.3)

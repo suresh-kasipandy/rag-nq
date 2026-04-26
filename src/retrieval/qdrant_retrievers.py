@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Literal, Protocol
 
 from src.config.settings import Settings
+from src.contracts.retrieval import Retriever
 from src.models.query_schemas import PassageHit
 from src.retrieval.sparse_qdrant import (
     SparsePass1Data,
@@ -40,12 +41,6 @@ class QdrantQueryClientLike(Protocol):
 Mode = Literal["dense", "sparse", "hybrid"]
 
 
-class RetrieverLike(Protocol):
-    """Minimal retriever contract used for mode routing."""
-
-    def retrieve(self, query: str, top_k: int) -> list[PassageHit]: ...
-
-
 @dataclass(slots=True)
 class DenseQdrantRetriever:
     """Dense retriever backed by Qdrant named dense vector search."""
@@ -56,7 +51,10 @@ class DenseQdrantRetriever:
 
     def __post_init__(self) -> None:
         if self.client is None:
-            self.client = _build_default_qdrant_client(self.settings.qdrant_url)
+            self.client = _build_default_qdrant_client(
+                self.settings.qdrant_url,
+                timeout=self.settings.qdrant_retrieval_timeout_seconds,
+            )
         if self.model is None:
             self.model = _build_default_embedding_model(self.settings.embedding_model_name)
 
@@ -71,7 +69,11 @@ class DenseQdrantRetriever:
             limit=top_k,
             with_payload=True,
         )
-        return _to_hits(_extract_points(response), score_field="dense_score", rank_field="dense_rank")
+        return _to_hits(
+            _extract_points(response),
+            score_field="dense_score",
+            rank_field="dense_rank",
+        )
 
 
 @dataclass(slots=True)
@@ -84,16 +86,24 @@ class SparseQdrantRetriever:
 
     def __post_init__(self) -> None:
         if self.client is None:
-            self.client = _build_default_qdrant_client(self.settings.qdrant_url)
+            self.client = _build_default_qdrant_client(
+                self.settings.qdrant_url,
+                timeout=self.settings.qdrant_retrieval_timeout_seconds,
+            )
         if self.pass1_data is None:
             self.pass1_data = load_sparse_pass1_artifact(
                 path=self.settings.sparse_pass1_path,
-                silver_path=self.settings.passages_path,
+                silver_path=self.settings.index_chunks_path,
                 max_passages=self.settings.max_passages,
+                sparse_analyzer=self.settings.sparse_analyzer,
             )
 
     def retrieve(self, query: str, top_k: int) -> list[PassageHit]:
-        indices, values = encode_query_sparse_vector(query, term_to_id=self.pass1_data.term_to_id)
+        indices, values = encode_query_sparse_vector(
+            query,
+            term_to_id=self.pass1_data.term_to_id,
+            analyzer=self.pass1_data.sparse_analyzer,
+        )
         if not indices:
             return []
         sparse_query = _build_sparse_query(indices=indices, values=values)
@@ -166,9 +176,9 @@ class QdrantModeRetriever:
 
     settings: Settings
     mode: Mode
-    dense: RetrieverLike | None = None
-    sparse: RetrieverLike | None = None
-    hybrid: RetrieverLike | None = None
+    dense: Retriever | None = None
+    sparse: Retriever | None = None
+    hybrid: Retriever | None = None
 
     def retrieve(self, query: str, top_k: int) -> list[PassageHit]:
         if self.mode == "dense":
@@ -192,7 +202,7 @@ class QdrantModeRetriever:
         raise ValueError(f"Unsupported retrieval mode {self.mode!r}.")
 
 
-def _build_default_qdrant_client(url: str) -> Any:
+def _build_default_qdrant_client(url: str, *, timeout: float) -> Any:
     try:
         from qdrant_client import QdrantClient
     except ModuleNotFoundError as exc:
@@ -201,9 +211,9 @@ def _build_default_qdrant_client(url: str) -> Any:
         ) from exc
 
     try:
-        return QdrantClient(url=url, check_compatibility=False)
+        return QdrantClient(url=url, timeout=timeout, check_compatibility=False)
     except TypeError:
-        return QdrantClient(url=url)
+        return QdrantClient(url=url, timeout=timeout)
 
 
 def _build_default_embedding_model(model_name: str) -> QueryEmbeddingModel:
@@ -233,11 +243,19 @@ def _to_hits(points: list[Any], *, score_field: str, rank_field: str) -> list[Pa
         if not isinstance(text, str) or not text:
             continue
         source = payload.get("source")
+        chunk_id = payload.get("chunk_id")
+        context_text = payload.get("context_text")
+        title = payload.get("title")
+        document_url = payload.get("document_url")
         score = float(getattr(point, "score", 0.0))
         data: dict[str, Any] = {
             "passage_id": str(getattr(point, "id", "")),
+            "chunk_id": chunk_id if isinstance(chunk_id, str) else str(getattr(point, "id", "")),
             "text": text,
+            "context_text": context_text if isinstance(context_text, str) else None,
             "source": source if isinstance(source, str) else None,
+            "title": title if isinstance(title, str) else None,
+            "document_url": document_url if isinstance(document_url, str) else None,
             score_field: score,
             rank_field: rank,
         }

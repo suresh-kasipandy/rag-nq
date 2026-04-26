@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from src.config.settings import Settings
-from src.ingestion.models import Passage
+from src.ingestion.models import IndexChunk, Passage
 from src.retrieval import dense_index
 from src.retrieval.dense_index import DenseIndexer
 
@@ -86,6 +86,38 @@ def test_dense_jsonl_streaming_batches(tmp_path) -> None:
         result = indexer.build_from_jsonl_streaming(path, lines_per_batch=2)
         assert result.vector_count == 5
         assert fake_client.upsert_batches == [2, 2, 1]
+    finally:
+        dense_index._build_vector_params = original_build_vector_params
+
+
+def test_dense_jsonl_streaming_accepts_index_chunks(tmp_path) -> None:
+    path = tmp_path / "index_chunks.jsonl"
+    chunk = IndexChunk(
+        chunk_id="11111111-1111-1111-1111-111111111111",
+        group_id="g1",
+        text="chunk text",
+        context_text="chunk text with context",
+        source_row_ordinal=0,
+        start_candidate_idx=0,
+        end_candidate_idx=0,
+        title="title",
+    )
+    path.write_text(chunk.model_dump_json() + "\n", encoding="utf-8")
+
+    settings = Settings(qdrant_collection="c_chunks", embedding_batch_size=8)
+    fake_client = FakeQdrantClient()
+    fake_model = FakeEmbeddingModel()
+    indexer = DenseIndexer(settings=settings, client=fake_client, model=fake_model)
+    original_build_vector_params = dense_index._build_vector_params
+
+    def _stub_vector_params(size: int, distance_name: str) -> dict[str, str | int]:
+        return {"size": size, "distance": distance_name}
+
+    dense_index._build_vector_params = _stub_vector_params
+    try:
+        result = indexer.build_from_jsonl_streaming(path, lines_per_batch=2)
+        assert result.vector_count == 1
+        assert fake_client.upsert_batches == [1]
     finally:
         dense_index._build_vector_params = original_build_vector_params
 

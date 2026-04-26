@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from src.config.settings import Settings
-from src.ingestion.models import Passage
+from src.ingestion.models import IndexChunk, Passage
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,23 +53,54 @@ class DenseBuildResult:
     vector_size: int
 
 
-def _qdrant_payload(passage: Passage) -> dict[str, object]:
-    """Serialize passage fields stored alongside dense vectors."""
+def _qdrant_payload(record: IndexChunk | Passage) -> dict[str, object]:
+    """Serialize fields stored alongside dense vectors."""
 
-    payload: dict[str, object] = {"text": passage.text}
-    if passage.source is not None:
-        payload["source"] = passage.source
-    if passage.title is not None:
-        payload["title"] = passage.title
-    if passage.question is not None:
-        payload["question"] = passage.question
-    if passage.passage_type is not None:
-        payload["passage_type"] = passage.passage_type
-    if passage.document_url is not None:
-        payload["document_url"] = passage.document_url
-    if passage.long_answers:
-        payload["long_answers"] = passage.long_answers
+    payload: dict[str, object] = {"text": record.text}
+    for name in (
+        "context_text",
+        "source",
+        "title",
+        "question",
+        "document_url",
+        "group_id",
+        "chunk_kind",
+    ):
+        value = getattr(record, name, None)
+        if value is not None:
+            payload[name] = value
+    if isinstance(record, IndexChunk):
+        payload.update(
+            {
+                "chunk_id": record.chunk_id,
+                "source_row_ordinal": record.source_row_ordinal,
+                "start_candidate_idx": record.start_candidate_idx,
+                "end_candidate_idx": record.end_candidate_idx,
+                "passage_types": record.passage_types,
+                "token_count": record.token_count,
+                "context_token_count": record.context_token_count,
+            }
+        )
+        if record.parent_candidate_idx is not None:
+            payload["parent_candidate_idx"] = record.parent_candidate_idx
+    elif record.passage_type is not None:
+        payload["passage_type"] = record.passage_type
+    if record.long_answers:
+        payload["long_answers"] = record.long_answers
     return payload
+
+
+def _record_id(record: IndexChunk | Passage) -> str:
+    return record.chunk_id if isinstance(record, IndexChunk) else record.passage_id
+
+
+def _record_from_json(line: str) -> IndexChunk | Passage:
+    payload = json.loads(line)
+    if not isinstance(payload, dict):
+        raise ValueError("JSONL line must decode to an object.")
+    if "chunk_id" in payload:
+        return IndexChunk.model_validate(payload)
+    return Passage.model_validate(payload)
 
 
 class DenseIndexer:
@@ -133,7 +164,7 @@ class DenseIndexer:
             LOGGER.info("resuming dense from checkpoint at %s passages", resume_count)
         vector_size = 0
         total_vectors = resume_count
-        batch: list[Passage] = []
+        batch: list[IndexChunk | Passage] = []
         consumed_non_empty_lines = 0
 
         def flush() -> None:
@@ -148,7 +179,7 @@ class DenseIndexer:
             )
             points = [
                 {
-                    "id": passage.passage_id,
+                    "id": _record_id(passage),
                     "vector": {self._settings.qdrant_vector_name: list(vector)},
                     "payload": _qdrant_payload(passage),
                 }
@@ -183,7 +214,7 @@ class DenseIndexer:
                 if consumed_non_empty_lines < resume_count:
                     consumed_non_empty_lines += 1
                     continue
-                batch.append(Passage.model_validate_json(line))
+                batch.append(_record_from_json(line))
                 if len(batch) >= lines_per_batch:
                     flush()
         flush()

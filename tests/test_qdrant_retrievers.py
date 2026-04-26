@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +13,7 @@ from src.retrieval.qdrant_retrievers import (
     HybridQdrantRetriever,
     QdrantModeRetriever,
     SparseQdrantRetriever,
+    _build_default_qdrant_client,
 )
 from src.retrieval.sparse_qdrant import SparsePass1Data
 
@@ -68,11 +70,13 @@ def _write_sparse_pass1_artifact(path: Path, *, max_passages: int | None = None)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": "1",
-        "silver_path": str((path.parent / "passages.jsonl").resolve()),
+        "silver_path": str((path.parent / "index_chunks.jsonl").resolve()),
         "max_passages": max_passages,
         "document_count": 2,
         "total_tokens": 5,
         "term_to_id": {"alpha": 0, "beta": 1},
+        "sparse_analyzer": "regex_stem_stop",
+        "sparse_analyzer_version": "1",
         "created_at_utc": "2026-01-01T00:00:00+00:00",
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -93,7 +97,7 @@ def test_sparse_retriever_uses_term_to_id_and_sets_sparse_fields(tmp_path: Path)
     output_dir = tmp_path / "artifacts"
     output_dir.mkdir(parents=True, exist_ok=True)
     settings = Settings(output_dir=output_dir, qdrant_collection="c")
-    (output_dir / "passages.jsonl").write_text("", encoding="utf-8")
+    (output_dir / "index_chunks.jsonl").write_text("", encoding="utf-8")
     _write_sparse_pass1_artifact(settings.sparse_pass1_path)
     client = FakeQueryClient()
     retriever = SparseQdrantRetriever(settings=settings, client=client)
@@ -145,7 +149,9 @@ def test_hybrid_retriever_rrf_combines_dense_and_sparse() -> None:
 
 def test_mode_retriever_routes_to_selected_mode() -> None:
     settings = Settings(qdrant_collection="c")
-    dense = SimpleNamespace(retrieve=lambda query, top_k: [PassageHit(passage_id="dense", text="d")])
+    dense = SimpleNamespace(
+        retrieve=lambda query, top_k: [PassageHit(passage_id="dense", text="d")]
+    )
     sparse = SimpleNamespace(
         retrieve=lambda query, top_k: [PassageHit(passage_id="sparse", text="s")]
     )
@@ -165,7 +171,9 @@ def test_mode_retriever_routes_to_selected_mode() -> None:
 
 def test_mode_retriever_dense_mode_does_not_require_sparse_dependencies() -> None:
     settings = Settings(qdrant_collection="c")
-    dense = SimpleNamespace(retrieve=lambda query, top_k: [PassageHit(passage_id="dense", text="d")])
+    dense = SimpleNamespace(
+        retrieve=lambda query, top_k: [PassageHit(passage_id="dense", text="d")]
+    )
     retriever = QdrantModeRetriever(
         settings=settings,
         mode="dense",
@@ -175,3 +183,18 @@ def test_mode_retriever_dense_mode_does_not_require_sparse_dependencies() -> Non
     )
     out = retriever.retrieve("q", top_k=1)
     assert out[0].passage_id == "dense"
+
+
+def test_build_default_qdrant_client_passes_timeout(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeQdrantClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    fake_module = SimpleNamespace(QdrantClient=FakeQdrantClient)
+    monkeypatch.setitem(sys.modules, "qdrant_client", fake_module)
+    client = _build_default_qdrant_client("http://localhost:6333", timeout=15.0)
+    assert isinstance(client, FakeQdrantClient)
+    assert captured["url"] == "http://localhost:6333"
+    assert captured["timeout"] == 15.0

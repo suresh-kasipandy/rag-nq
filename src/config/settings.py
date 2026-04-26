@@ -26,14 +26,19 @@ class Settings(BaseModel):
     embedding_batch_size: int = Field(default=64, ge=1)
 
     qdrant_url: str = "http://localhost:6333"
+    qdrant_retrieval_timeout_seconds: float = Field(default=15.0, gt=0)
     qdrant_collection: str = "nq_passages"
     qdrant_vector_name: str = "dense"
     qdrant_sparse_vector_name: str = "sparse"
     qdrant_distance: Literal["Cosine", "Dot", "Euclid", "Manhattan"] = "Cosine"
 
     output_dir: Path = Path("artifacts")
+    raw_dataset_jsonl: str = "raw_dataset.jsonl"
+    raw_manifest_file: str = "raw_ingest_manifest.json"
     passages_jsonl: str = "passages.jsonl"
     ingest_manifest_file: str = "ingest_manifest.json"
+    index_chunks_jsonl: str = "index_chunks.jsonl"
+    chunk_manifest_file: str = "chunk_manifest.json"
     dense_checkpoint_file: str = "dense_checkpoint.json"
     sparse_checkpoint_file: str = "sparse_checkpoint.json"
     sparse_pass1_file: str = "sparse_pass1.json"
@@ -48,6 +53,14 @@ class Settings(BaseModel):
     bm25_k1: float = Field(default=1.5, gt=0)
     bm25_b: float = Field(default=0.75, ge=0, le=1)
     bm25_epsilon: float = Field(default=0.25, ge=0)
+    sparse_analyzer: Literal["whitespace", "regex", "regex_stem", "regex_stem_stop"] = (
+        "regex_stem_stop"
+    )
+    chunk_min_tokens_soft: int = Field(default=60, ge=1)
+    chunk_min_tokens_hard: int = Field(default=20, ge=1)
+    chunk_target_tokens: int = Field(default=160, ge=1)
+    chunk_max_tokens: int = Field(default=300, ge=1)
+    chunk_context_text_token_cap: int = Field(default=400, ge=1)
     hybrid_rrf_k: int = Field(default=60, ge=1)
     hybrid_dense_weight: float = Field(default=1.0, ge=0)
     hybrid_sparse_weight: float = Field(default=1.0, ge=0)
@@ -56,6 +69,26 @@ class Settings(BaseModel):
     def passages_path(self) -> Path:
         """Return path where normalized passages are persisted."""
         return self.output_dir / self.passages_jsonl
+
+    @property
+    def index_chunks_path(self) -> Path:
+        """Return path where index chunks are persisted."""
+        return self.output_dir / self.index_chunks_jsonl
+
+    @property
+    def chunk_manifest_path(self) -> Path:
+        """Return path for chunk manifest."""
+        return self.output_dir / self.chunk_manifest_file
+
+    @property
+    def raw_dataset_path(self) -> Path:
+        """Return path where raw dataset rows are persisted."""
+        return self.output_dir / self.raw_dataset_jsonl
+
+    @property
+    def raw_manifest_path(self) -> Path:
+        """Return path for raw dataset ingest manifest."""
+        return self.output_dir / self.raw_manifest_file
 
     @property
     def ingest_manifest_path(self) -> Path:
@@ -109,6 +142,8 @@ class Settings(BaseModel):
             overrides["embedding_model_name"] = value
         if value := os.getenv("RAG_QDRANT_URL"):
             overrides["qdrant_url"] = value
+        if value := os.getenv("RAG_QDRANT_RETRIEVAL_TIMEOUT_SECONDS"):
+            overrides["qdrant_retrieval_timeout_seconds"] = float(value)
         if value := os.getenv("RAG_QDRANT_COLLECTION"):
             overrides["qdrant_collection"] = value
         if value := os.getenv("RAG_QDRANT_SPARSE_VECTOR_NAME"):
@@ -117,6 +152,10 @@ class Settings(BaseModel):
             overrides["sparse_checkpoint_file"] = value
         if value := os.getenv("RAG_SPARSE_PASS1_FILE"):
             overrides["sparse_pass1_file"] = value
+        if value := os.getenv("RAG_INDEX_CHUNKS_JSONL"):
+            overrides["index_chunks_jsonl"] = value
+        if value := os.getenv("RAG_CHUNK_MANIFEST_FILE"):
+            overrides["chunk_manifest_file"] = value
         if value := os.getenv("RAG_OUTPUT_DIR"):
             overrides["output_dir"] = Path(value)
         if value := os.getenv("RAG_MAX_PASSAGES"):
@@ -137,6 +176,18 @@ class Settings(BaseModel):
             overrides["bm25_b"] = float(value)
         if value := os.getenv("RAG_BM25_EPSILON"):
             overrides["bm25_epsilon"] = float(value)
+        if value := os.getenv("RAG_SPARSE_ANALYZER"):
+            overrides["sparse_analyzer"] = value
+        if value := os.getenv("RAG_CHUNK_MIN_TOKENS_SOFT"):
+            overrides["chunk_min_tokens_soft"] = int(value)
+        if value := os.getenv("RAG_CHUNK_MIN_TOKENS_HARD"):
+            overrides["chunk_min_tokens_hard"] = int(value)
+        if value := os.getenv("RAG_CHUNK_TARGET_TOKENS"):
+            overrides["chunk_target_tokens"] = int(value)
+        if value := os.getenv("RAG_CHUNK_MAX_TOKENS"):
+            overrides["chunk_max_tokens"] = int(value)
+        if value := os.getenv("RAG_CHUNK_CONTEXT_TEXT_TOKEN_CAP"):
+            overrides["chunk_context_text_token_cap"] = int(value)
         if value := os.getenv("RAG_HYBRID_RRF_K"):
             overrides["hybrid_rrf_k"] = int(value)
         if value := os.getenv("RAG_HYBRID_DENSE_WEIGHT"):
@@ -150,6 +201,15 @@ class Settings(BaseModel):
         """Return True when ``RAG_FORCE_INGEST`` requests a silver rebuild."""
 
         value = os.getenv("RAG_FORCE_INGEST")
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def force_raw_ingest_from_env() -> bool:
+        """Return True when ``RAG_FORCE_RAW_INGEST`` requests raw dataset rebuild."""
+
+        value = os.getenv("RAG_FORCE_RAW_INGEST")
         if value is None:
             return False
         return value.strip().lower() in {"1", "true", "yes", "on"}

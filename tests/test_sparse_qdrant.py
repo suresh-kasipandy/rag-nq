@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,13 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
 
 from src.config.settings import Settings
-from src.ingestion.models import SPARSE_INDEX_MANIFEST_VERSION, Passage, SparseIndexManifest
+from src.ingestion.models import (
+    SPARSE_INDEX_MANIFEST_VERSION,
+    IndexChunk,
+    Passage,
+    SparseIndexManifest,
+)
+from src.retrieval.sparse_index import SPARSE_ANALYZER_VERSION
 from src.retrieval.sparse_qdrant import (
     SparseQdrantIndexer,
     _pass1_scan,
@@ -63,13 +70,17 @@ def test_sparse_dot_product_matches_bm25_scores(tmp_path: Path) -> None:
             handle.write("\n")
 
     bm25 = BM25Okapi(corpus)
-    p1 = _pass1_scan(path, max_passages=None)
+    p1 = _pass1_scan(path, max_passages=None, analyzer="whitespace")
     assert p1.document_count == len(texts)
     idf = compute_okapi_idf(p1.nd, p1.document_count, epsilon=0.25)
 
     query_tokens = "the sat".split()
     expected = bm25.get_scores(query_tokens)
-    q_i, q_v = encode_query_sparse_vector("the sat", term_to_id=p1.term_to_id)
+    q_i, q_v = encode_query_sparse_vector(
+        "the sat",
+        term_to_id=p1.term_to_id,
+        analyzer="whitespace",
+    )
 
     for i, t in enumerate(texts):
         d_i, d_v = _sparse_vector_for_passage(
@@ -80,6 +91,7 @@ def test_sparse_dot_product_matches_bm25_scores(tmp_path: Path) -> None:
             total_tokens=p1.total_tokens,
             k1=1.5,
             b=0.75,
+            analyzer="whitespace",
         )
         got = _sparse_dot(q_i, q_v, d_i, d_v)
         assert got == pytest.approx(float(expected[i]), rel=1e-5, abs=1e-5)
@@ -127,6 +139,7 @@ def test_sparse_qdrant_end_to_end_in_memory(tmp_path: Path) -> None:
         qdrant_sparse_vector_name="sparse",
         sparse_upsert_batch_size=1,
         output_dir=tmp_path / "out",
+        sparse_analyzer="whitespace",
     )
     indexer = SparseQdrantIndexer(settings=settings, client=client)
     result = indexer.build_from_jsonl(path)
@@ -140,14 +153,15 @@ def test_sparse_qdrant_end_to_end_in_memory(tmp_path: Path) -> None:
     assert loaded.schema_version == SPARSE_INDEX_MANIFEST_VERSION
     assert loaded.points_updated == 2
 
-    p1 = _pass1_scan(path, max_passages=None)
-    q_i, q_v = encode_query_sparse_vector("the", term_to_id=p1.term_to_id)
+    p1 = _pass1_scan(path, max_passages=None, analyzer="whitespace")
+    q_i, q_v = encode_query_sparse_vector("the", term_to_id=p1.term_to_id, analyzer="whitespace")
     assert q_i, "fixture should yield a non-empty query sparse vector"
 
     pass1_artifact = load_sparse_pass1_artifact(
         path=settings.sparse_pass1_path,
         silver_path=path,
         max_passages=None,
+        sparse_analyzer="whitespace",
     )
     assert pass1_artifact.document_count == 2
     assert pass1_artifact.term_to_id == p1.term_to_id
@@ -187,6 +201,33 @@ def _write_sparse_fixture(path: Path, ids: list[str]) -> None:
         for i, pid in enumerate(ids):
             handle.write(Passage(passage_id=pid, text=f"text {i}").model_dump_json())
             handle.write("\n")
+
+
+def test_sparse_indexer_uses_chunk_id_for_index_chunks(tmp_path: Path) -> None:
+    chunk = IndexChunk(
+        chunk_id=str(uuid.uuid4()),
+        group_id="group-1",
+        text="Mercury is the smallest planet.",
+        context_text="Mercury is the smallest planet in the Solar System.",
+        source_row_ordinal=0,
+        start_candidate_idx=1,
+        end_candidate_idx=1,
+    )
+    chunks = tmp_path / "index_chunks.jsonl"
+    chunks.write_text(chunk.model_dump_json() + "\n", encoding="utf-8")
+    settings = Settings(
+        output_dir=tmp_path / "artifacts",
+        sparse_upsert_batch_size=1,
+        qdrant_sparse_vector_name="sparse",
+        qdrant_collection="nq_passages",
+    )
+
+    client = FakeSparseClient()
+    indexer = SparseQdrantIndexer(settings=settings, client=client)
+    result = indexer.build_from_jsonl(chunks)
+
+    assert result.points_updated == 1
+    assert client.updated_ids == [[chunk.chunk_id]]
 
 
 def test_sparse_resume_uses_checkpoint_after_partial_failure(tmp_path: Path) -> None:
@@ -267,3 +308,43 @@ def test_sparse_concurrency_smoke_keeps_batch_size(tmp_path: Path) -> None:
     assert result.points_updated == 4
     assert len(client.updated_ids) == 2
     assert sorted(len(batch) for batch in client.updated_ids) == [2, 2]
+
+
+def test_sparse_build_reuses_existing_pass1_artifact(tmp_path: Path, monkeypatch) -> None:
+    ids = [str(uuid.uuid4()) for _ in range(2)]
+    silver = tmp_path / "silver.jsonl"
+    _write_sparse_fixture(silver, ids)
+    settings = Settings(
+        output_dir=tmp_path / "artifacts",
+        sparse_upsert_batch_size=1,
+        qdrant_sparse_vector_name="sparse",
+        qdrant_collection="nq_passages",
+    )
+
+    p1 = _pass1_scan(silver, max_passages=None)
+    settings.sparse_pass1_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.sparse_pass1_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "silver_path": str(silver.resolve()),
+                "max_passages": None,
+                "document_count": p1.document_count,
+                "total_tokens": p1.total_tokens,
+                "term_to_id": p1.term_to_id,
+                "sparse_analyzer": "regex_stem_stop",
+                "sparse_analyzer_version": SPARSE_ANALYZER_VERSION,
+                "created_at_utc": "2026-01-01T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _fail_pass1_scan(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("build_from_jsonl should reuse existing pass1 artifact")
+
+    monkeypatch.setattr("src.retrieval.sparse_qdrant._pass1_scan", _fail_pass1_scan)
+    client = FakeSparseClient()
+    indexer = SparseQdrantIndexer(settings=settings, client=client)
+    result = indexer.build_from_jsonl(silver)
+    assert result.points_updated == 2

@@ -8,8 +8,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.config.settings import Settings
-from src.ingestion.models import SILVER_SCHEMA_VERSION, IngestManifest
-from src.ingestion.nq_loader import iter_nq_passages
+from src.ingestion.ingest_raw import (
+    load_raw_manifest,
+    raw_inputs_match_manifest,
+    run_raw_ingest,
+)
+from src.ingestion.models import (
+    RAW_DATASET_SCHEMA_VERSION,
+    SILVER_SCHEMA_VERSION,
+    IngestManifest,
+)
+from src.ingestion.nq_loader import iter_nq_passages_from_raw_artifact
 from src.observability.logging_setup import get_stage_logger
 
 LOGGER = get_stage_logger(__name__)
@@ -40,8 +49,8 @@ def _ingest_inputs_match_manifest(settings: Settings, manifest: IngestManifest) 
         and manifest.dataset_name == settings.dataset_name
         and manifest.dataset_split == settings.dataset_split
         and manifest.max_passages == settings.max_passages
+        and manifest.raw_schema_version == RAW_DATASET_SCHEMA_VERSION
     )
-
 
 def should_skip_ingest(settings: Settings, *, force: bool = False) -> bool:
     """Return True when existing silver matches manifest and ``RAG_FORCE_INGEST`` is off."""
@@ -57,6 +66,11 @@ def should_skip_ingest(settings: Settings, *, force: bool = False) -> bool:
         return False
     if not _ingest_inputs_match_manifest(settings, manifest):
         return False
+    raw_manifest = load_raw_manifest(settings.raw_manifest_path)
+    if raw_manifest is None or not raw_inputs_match_manifest(settings, raw_manifest):
+        return False
+    if manifest.raw_row_count != raw_manifest.row_count:
+        return False
     try:
         lines = count_jsonl_lines(passages)
     except OSError:
@@ -69,13 +83,20 @@ def _replace_atomic(tmp: Path, final: Path) -> None:
     os.replace(tmp, final)
 
 
-def run_ingest(settings: Settings, *, force: bool = False) -> tuple[IngestManifest, bool]:
-    """Stream NQ rows into ``passages.jsonl`` and write ``ingest_manifest.json`` atomically.
+def run_ingest(
+    settings: Settings, *, force: bool = False, from_hf: bool = False
+) -> tuple[IngestManifest, bool]:
+    """Expand raw rows into ``passages.jsonl`` and write ingest manifest atomically.
 
     Returns ``(manifest, skipped)`` where ``skipped`` is True when existing silver was reused.
     """
 
-    if should_skip_ingest(settings, force=force):
+    raw_manifest, _ = run_raw_ingest(
+        settings,
+        force=from_hf or Settings.force_raw_ingest_from_env(),
+    )
+
+    if not from_hf and should_skip_ingest(settings, force=force):
         manifest = load_ingest_manifest(settings.ingest_manifest_path)
         assert manifest is not None  # guarded by should_skip_ingest
         LOGGER.info(
@@ -93,7 +114,7 @@ def run_ingest(settings: Settings, *, force: bool = False) -> tuple[IngestManife
 
     line_count = 0
     with tmp_jsonl.open("w", encoding="utf-8") as handle:
-        for passage in iter_nq_passages(settings):
+        for passage in iter_nq_passages_from_raw_artifact(settings):
             handle.write(passage.model_dump_json())
             handle.write("\n")
             line_count += 1
@@ -108,6 +129,8 @@ def run_ingest(settings: Settings, *, force: bool = False) -> tuple[IngestManife
         dataset_split=settings.dataset_split,
         max_passages=settings.max_passages,
         line_count=line_count,
+        raw_schema_version=raw_manifest.schema_version,
+        raw_row_count=raw_manifest.row_count,
         created_at_utc=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     )
     with tmp_manifest.open("w", encoding="utf-8") as handle:

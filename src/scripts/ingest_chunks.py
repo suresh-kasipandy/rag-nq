@@ -1,4 +1,4 @@
-"""CLI: stream Hugging Face NQ-retrieval into silver ``passages.jsonl`` + ingest manifest."""
+"""CLI: build chunked index corpus from raw NQ rows."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import logging
 
 from src.config.settings import Settings
-from src.ingestion.ingest_silver import run_ingest
+from src.ingestion.chunk_raw import run_chunk_ingest
 from src.observability.logging_setup import get_stage_logger, setup_logging
 
 LOGGER = get_stage_logger(__name__)
@@ -15,26 +15,20 @@ LOGGER = get_stage_logger(__name__)
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--from-hf",
-        action="store_true",
-        help="Refresh raw dataset from Hugging Face before building silver passages.",
-    )
-    parser.add_argument(
         "--force",
         action="store_true",
-        help="Force rebuild raw and silver artifacts even if manifests match.",
+        help="Force rebuild chunk artifacts even if manifests match.",
     )
     args = parser.parse_args()
 
     setup_logging(level=logging.INFO)
     settings = Settings.from_env()
-    manifest, skipped = run_ingest(
+    manifest, skipped = run_chunk_ingest(
         settings,
         force=args.force or Settings.force_ingest_from_env(),
-        from_hf=args.from_hf,
     )
     LOGGER.info(
-        "ingest complete: lines=%s skipped=%s",
+        "chunk ingest complete: chunks=%s skipped=%s",
         manifest.line_count,
         skipped,
         extra={"stage": "done"},

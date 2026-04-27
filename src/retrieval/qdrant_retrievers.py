@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from types import SimpleNamespace
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from src.config.settings import Settings
 from src.contracts.retrieval import Retriever
@@ -74,9 +75,7 @@ class DenseQdrantRetriever:
             self.model = _build_default_embedding_model(self.settings.embedding_model_name)
 
     def retrieve(self, query: str, top_k: int) -> list[PassageHit]:
-        vector = self.model.encode(
-            [query], batch_size=1, normalize_embeddings=True
-        )[0]
+        vector = _encode_query_vector(self.model, query)
         response = self.client.query_points(
             self.settings.qdrant_collection,
             query=list(vector),
@@ -319,6 +318,28 @@ def _build_default_embedding_model(model_name: str) -> QueryEmbeddingModel:
             "sentence-transformers is required for dense retrieval. Install dependencies first."
         ) from exc
     return SentenceTransformer(model_name)
+
+
+def _encode_query_vector(model: QueryEmbeddingModel, query: str) -> list[float]:
+    encode = cast(Any, model.encode)
+    if _accepts_keyword(encode, "show_progress_bar"):
+        return encode(
+            [query],
+            batch_size=1,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )[0]
+    return model.encode([query], batch_size=1, normalize_embeddings=True)[0]
+
+
+def _accepts_keyword(callable_object: Any, keyword: str) -> bool:
+    try:
+        parameters = signature(callable_object).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 def _extract_points(response: Any) -> list[Any]:

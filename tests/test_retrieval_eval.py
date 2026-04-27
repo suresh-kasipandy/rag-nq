@@ -18,6 +18,7 @@ from src.evaluation.retrieval_eval import (
 from src.ingestion.models import IndexChunk, Passage
 from src.ingestion.passage_store import PassageStore
 from src.models.query_schemas import PassageHit
+from src.scripts.eval_retrieval import _quiet_dependency_logs
 
 
 def test_metric_functions_on_toy_ranked_list() -> None:
@@ -263,12 +264,39 @@ def test_run_retrieval_eval_logs_mode_progress(
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("[retrieval_eval_cases] start records=0" in msg for msg in messages)
-    assert any("[retrieval_eval_cases] progress records=1" in msg for msg in messages)
     assert any("[retrieval_eval_cases] complete records=2" in msg for msg in messages)
     assert any("[retrieval_eval] retrieval eval start" in msg for msg in messages)
     assert any("[retrieval_eval_mode] start queries=0/2" in msg for msg in messages)
     assert any("[retrieval_eval_mode] progress queries=1/2" in msg for msg in messages)
     assert any("[retrieval_eval_mode] complete queries=2/2" in msg for msg in messages)
+
+
+def test_eval_cli_quiets_dependency_logs() -> None:
+    logger_names = [
+        "httpx",
+        "httpcore",
+        "huggingface_hub",
+        "sentence_transformers",
+        "transformers",
+        "qdrant_client",
+        "src.retrieval.qdrant_retrievers",
+    ]
+    previous_levels = {
+        logger_name: logging.getLogger(logger_name).level for logger_name in logger_names
+    }
+    try:
+        for logger_name in logger_names:
+            logging.getLogger(logger_name).setLevel(logging.INFO)
+
+        _quiet_dependency_logs()
+
+        assert all(
+            logging.getLogger(logger_name).level == logging.WARNING
+            for logger_name in logger_names
+        )
+    finally:
+        for logger_name, level in previous_levels.items():
+            logging.getLogger(logger_name).setLevel(level)
 
 
 def test_run_retrieval_eval_can_use_candidate_span_overlap(

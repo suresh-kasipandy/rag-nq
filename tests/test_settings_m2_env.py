@@ -8,6 +8,13 @@ import pytest
 from src.config.settings import Settings
 
 
+def test_hybrid_weight_defaults_bias_sparse_over_dense() -> None:
+    settings = Settings()
+
+    assert settings.hybrid_dense_weight == pytest.approx(0.5)
+    assert settings.hybrid_sparse_weight == pytest.approx(1.0)
+
+
 def test_from_env_max_passages_and_embedding_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

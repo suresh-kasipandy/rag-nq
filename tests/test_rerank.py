@@ -11,6 +11,15 @@ class FakeCrossEncoder:
         return [10.0 if "better" in passage else 1.0 for _query, passage in pairs]
 
 
+class FakeCrossEncoderWithProgressFlag:
+    def __init__(self) -> None:
+        self.show_progress_bar: bool | None = None
+
+    def predict(self, pairs, *, show_progress_bar: bool):
+        self.show_progress_bar = show_progress_bar
+        return [10.0 if "better" in passage else 1.0 for _query, passage in pairs]
+
+
 def test_build_rerank_input_prefers_bounded_context_text() -> None:
     hit = PassageHit(
         point_id="p1",
@@ -39,6 +48,24 @@ def test_rerank_hits_orders_by_cross_encoder_score() -> None:
     assert [hit.rerank_rank for hit in reranked] == [1, 2]
     assert reranked[0].rerank_score == pytest.approx(10.0)
     assert hits[0].rerank_rank is None
+
+
+def test_rerank_hits_disables_cross_encoder_progress_bar() -> None:
+    hits = [
+        PassageHit(point_id="p1", text="plain", fusion_rank=1),
+        PassageHit(point_id="p2", text="better evidence", fusion_rank=2),
+    ]
+    model = FakeCrossEncoderWithProgressFlag()
+
+    reranked = rerank_hits(
+        query="q",
+        hits=hits,
+        model=model,
+        context_token_budget=100,
+    )
+
+    assert [hit.point_id for hit in reranked] == ["p2", "p1"]
+    assert model.show_progress_bar is False
 
 
 def test_dedupe_hits_uses_title_and_context_text_with_aliases_and_metrics() -> None:

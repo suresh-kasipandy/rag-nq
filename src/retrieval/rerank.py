@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from inspect import Parameter, signature
+from typing import Any, Protocol, cast
 
 from src.models.query_schemas import DedupeMetrics, DuplicateAlias, PassageHit
 
@@ -49,8 +50,11 @@ def rerank_hits(
 
     if not hits:
         return []
-    pairs = [(query, build_rerank_input(hit, context_token_budget=context_token_budget)) for hit in hits]
-    scores = [float(score) for score in model.predict(pairs)]
+    pairs = [
+        (query, build_rerank_input(hit, context_token_budget=context_token_budget))
+        for hit in hits
+    ]
+    scores = _predict_scores(model, pairs)
     ranked = [
         hit.model_copy(update={"rerank_score": score}, deep=True)
         for hit, score in zip(hits, scores, strict=True)
@@ -109,6 +113,25 @@ def _normalize(value: str | None) -> str:
     if not value:
         return ""
     return _WHITESPACE_RE.sub(" ", value).strip().casefold()
+
+
+def _predict_scores(
+    model: CrossEncoderLike, pairs: Sequence[tuple[str, str]]
+) -> list[float]:
+    predict = cast(Any, model.predict)
+    if _accepts_keyword(predict, "show_progress_bar"):
+        return [float(score) for score in predict(pairs, show_progress_bar=False)]
+    return [float(score) for score in model.predict(pairs)]
+
+
+def _accepts_keyword(callable_object: Any, keyword: str) -> bool:
+    try:
+        parameters = signature(callable_object).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 def _duplicate_alias(hit: PassageHit) -> DuplicateAlias:

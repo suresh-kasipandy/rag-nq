@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 from src.config.settings import Settings
@@ -14,6 +15,21 @@ from src.observability.logging_setup import setup_logging
 from src.retrieval.qdrant_retrievers import Mode
 
 MODE_VALUES: set[Mode] = set(SUPPORTED_EVAL_MODES)
+
+
+def _quiet_dependency_logs() -> None:
+    """Keep eval CLI output focused on stage progress and final metrics."""
+
+    for logger_name in (
+        "httpx",
+        "httpcore",
+        "huggingface_hub",
+        "sentence_transformers",
+        "transformers",
+        "qdrant_client",
+        "src.retrieval.qdrant_retrievers",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def _positive_int(value: str) -> int:
@@ -61,6 +77,7 @@ def _mode_value(value: str) -> Mode:
 
 def main() -> None:
     setup_logging()
+    _quiet_dependency_logs()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--top-k",

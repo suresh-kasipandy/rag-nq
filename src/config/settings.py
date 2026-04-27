@@ -69,7 +69,7 @@ class Settings(BaseModel):
     progress_log_every_batches: int = Field(default=500, ge=1)
     progress_log_every_seconds: float = Field(default=60.0, gt=0)
     hybrid_rrf_k: int = Field(default=60, ge=1)
-    hybrid_dense_weight: float = Field(default=1.0, ge=0)
+    hybrid_dense_weight: float = Field(default=0.5, ge=0)
     hybrid_sparse_weight: float = Field(default=1.0, ge=0)
     retrieve_k: int = Field(default=50, ge=1)
     rerank_k: int | None = Field(default=None, ge=1)

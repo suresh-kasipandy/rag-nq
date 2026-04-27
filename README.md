@@ -142,3 +142,86 @@ Chunk ingestion follows the HuggingFace `sentence-transformers/NQ-retrieval` lay
 - **Staged (Milestone 3.6):** `ingest_chunks` → `index_dense` → `index_sparse`, or `build_indexes` for one chain (see Milestone 3.6 above).
 - Doctor: `python -m src.scripts.doctor`
 - Tests (from repo root): `pytest rag-nq-showcase/tests`
+
+## Milestone 7 — local API runbook
+
+Start Qdrant, build or reuse indexes, then run the FastAPI app:
+
+```bash
+cd rag-nq-showcase
+docker compose up -d
+python -m src.scripts.doctor
+python -m uvicorn app.api.main:app --reload
+```
+
+OpenAPI docs are available at `http://127.0.0.1:8000/docs`.
+
+### API endpoints
+
+- `GET /health` — lightweight API liveness check.
+- `GET /config` — safe runtime metadata: dataset/model names, Qdrant collection/vector names, retrieval/generation knobs, and local artifact presence. It does not expose provider secrets, API keys, or raw environment dumps.
+- `POST /retrieve` — retrieval-only diagnostics. Body:
+
+  ```json
+  {
+    "query": "What is the capital of France?",
+    "mode": "hybrid",
+    "top_k": 10
+  }
+  ```
+
+- `POST /query` — retrieval plus optional grounded generation. Body:
+
+  ```json
+  {
+    "query": "What is the capital of France?",
+    "mode": "hybrid",
+    "top_k": 10,
+    "generate": true
+  }
+  ```
+
+Both retrieval endpoints return typed `QueryResponse` payloads with retrieved `point_id`s,
+ranks/scores where available, retrieval timing/dedupe metrics, and generated citations when
+generation is enabled.
+
+### Local troubleshooting
+
+- **Qdrant not reachable:** run `docker compose up -d`, confirm `RAG_QDRANT_URL` points to the running service, then run `RAG_DOCTOR_CHECK_QDRANT=1 python -m src.scripts.doctor`.
+- **Missing chunk artifact:** rebuild the default corpus with `python -m src.ingestion.ingest_raw` followed by `python -m src.scripts.ingest_chunks`, or run `python -m src.scripts.build_indexes`.
+- **Stale `passages.jsonl` indexes:** the default path after Milestone 3.6 is `artifacts/index_chunks.jsonl`; rebuild dense and sparse indexes from chunks before comparing retrieval results.
+- **Missing sparse vectors / wrong sparse vector name:** check `RAG_QDRANT_SPARSE_VECTOR_NAME`, confirm `artifacts/sparse_index_manifest.json` matches the target collection, and rerun `python -m src.scripts.index_sparse`.
+- **Partial sparse migration or stale collection:** rebuild sparse vectors against the current dense collection; if the collection schema is incompatible, use the migration/recreate workflow documented above.
+- **Hybrid query looks worse than sparse:** compare `dense`, `sparse`, and `hybrid` through `/retrieve`; tune `RAG_HYBRID_DENSE_WEIGHT`, `RAG_HYBRID_SPARSE_WEIGHT`, `RAG_RETRIEVE_K`, and rerank settings before treating hybrid as the default.
+
+## Milestone 8 — Streamlit portfolio UI
+
+Start Qdrant and the FastAPI service, then launch the Streamlit demo:
+
+```bash
+cd rag-nq-showcase
+docker compose up -d
+uv run uvicorn app.api.main:app
+uv run streamlit run app/streamlit_app.py
+```
+
+The UI defaults to `http://127.0.0.1:8000` for the API and
+`artifacts/retrieval_eval.json` for the eval dashboard. Both can be changed in
+the sidebar without editing `.env`.
+
+### UI panels
+
+- **Query Playground:** sends `/query` requests with retrieval mode, `top_k`, and
+  generation controls. Abstained grounded answers are shown as a human-readable
+  "not enough evidence" message while preserving the backend `answer` contract.
+- **Retrieval Inspector:** sends `/retrieve` requests for dense, sparse, and
+  hybrid modes side by side, including point IDs, rank metadata, context, spans,
+  and duplicate aliases where available.
+- **Eval Dashboard:** reads the persisted retrieval eval JSON artifact and
+  summarizes Recall@k, MRR@k, NDCG@k, winners, and run config.
+- **System / Runbook:** shows `/health`, safe `/config` metadata, artifact
+  status, and copyable local commands.
+
+The Streamlit UI is a presentation layer only. It does not rebuild indexes,
+modify environment files, reset Qdrant, or import internal retriever/generator
+classes for live behavior.

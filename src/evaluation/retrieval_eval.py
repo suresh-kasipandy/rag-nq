@@ -19,6 +19,7 @@ from src.retrieval.qdrant_retrievers import Mode, QdrantModeRetriever
 
 LOGGER = get_stage_logger(__name__)
 SUPPORTED_EVAL_MODES: tuple[Mode, Mode, Mode] = ("dense", "sparse", "hybrid")
+_MIN_CASE_PROGRESS_RECORD_INTERVAL = 500_000
 RelevanceContract = Literal[
     "answer_overlap",
     "point_id",
@@ -172,7 +173,7 @@ def run_retrieval_evaluation(
     eval_cases = build_eval_cases_from_index_artifact(
         resolved_corpus_path,
         max_queries=max_queries,
-        progress_every_records=settings.progress_log_every_records,
+        progress_every_records=_case_progress_record_interval(settings),
         progress_every_seconds=settings.progress_log_every_seconds,
     )
     LOGGER.info(
@@ -341,6 +342,10 @@ def _build_case_progress_ticker(
         every_items=progress_every_records,
         every_seconds=progress_every_seconds,
     )
+
+
+def _case_progress_record_interval(settings: Settings) -> int:
+    return max(settings.progress_log_every_records, _MIN_CASE_PROGRESS_RECORD_INTERVAL)
 
 
 def evaluate_mode(

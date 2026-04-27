@@ -27,6 +27,24 @@ class FakeEmbeddingModel:
         return [[0.2, 0.8] for _ in texts]
 
 
+class FakeEmbeddingModelWithProgressFlag:
+    def __init__(self) -> None:
+        self.show_progress_bar: bool | None = None
+
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        batch_size: int,
+        normalize_embeddings: bool,
+        show_progress_bar: bool,
+    ) -> list[list[float]]:
+        assert batch_size == 1
+        assert normalize_embeddings is True
+        self.show_progress_bar = show_progress_bar
+        return [[0.2, 0.8] for _ in texts]
+
+
 class FakeReranker:
     def predict(self, pairs):
         return [10.0 if "best" in passage else 1.0 for _query, passage in pairs]
@@ -98,6 +116,17 @@ def test_dense_retriever_maps_scores_and_ranks() -> None:
     assert hits[0].sparse_score is None
 
 
+def test_dense_retriever_disables_sentence_transformer_progress_bar() -> None:
+    settings = Settings(qdrant_collection="c")
+    client = FakeQueryClient()
+    model = FakeEmbeddingModelWithProgressFlag()
+    retriever = DenseQdrantRetriever(settings=settings, client=client, model=model)
+
+    retriever.retrieve("hello", top_k=2)
+
+    assert model.show_progress_bar is False
+
+
 def test_sparse_retriever_uses_term_to_id_and_sets_sparse_fields(tmp_path: Path) -> None:
     output_dir = tmp_path / "artifacts"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -146,7 +175,7 @@ def test_hybrid_retriever_rrf_combines_dense_and_sparse() -> None:
     )
     retriever = HybridQdrantRetriever(settings=settings, dense=dense, sparse=sparse)
     hits = retriever.retrieve("hello", top_k=3)
-    assert [h.point_id for h in hits] == ["p2", "p1", "p3"]
+    assert [h.point_id for h in hits] == ["p2", "p3", "p1"]
     assert [h.fusion_rank for h in hits] == [1, 2, 3]
     assert hits[0].dense_rank == 2
     assert hits[0].sparse_rank == 1

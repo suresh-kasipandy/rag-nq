@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-import streamlit as st
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.ui.api_client import ApiClientError, RagApiClient, RetrievalMode
-from app.ui.display import answer_display_text, hit_rank_summary, hit_title
-from app.ui.eval_report import load_eval_report, rows_as_dicts, summarize_eval_report
-from src.models.query_schemas import PassageHit, QueryResponse
+import streamlit as st  # noqa: E402
+
+from app.ui.api_client import ApiClientError, RagApiClient, RetrievalMode  # noqa: E402
+from app.ui.display import answer_display_text, hit_rank_summary, hit_title  # noqa: E402
+from app.ui.eval_report import load_eval_report, rows_as_dicts, summarize_eval_report  # noqa: E402
+from src.models.query_schemas import PassageHit, QueryResponse  # noqa: E402
 
 MODES: tuple[RetrievalMode, RetrievalMode, RetrievalMode] = ("dense", "sparse", "hybrid")
 

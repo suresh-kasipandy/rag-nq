@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import urllib.error
 from pathlib import Path
 from typing import Any
@@ -11,6 +14,8 @@ from app.ui.api_client import ApiClientError, RagApiClient
 from app.ui.display import DEFAULT_ABSTENTION_MESSAGE, answer_display_text, hit_rank_summary
 from app.ui.eval_report import load_eval_report, rows_as_dicts, summarize_eval_report
 from src.models.query_schemas import GroundedAnswer, PassageHit
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeHttpResponse:
@@ -68,6 +73,23 @@ def test_api_client_shapes_query_request_and_validates_response(monkeypatch) -> 
     }
     assert response.grounded is not None
     assert response.grounded.citations[0].point_id == "p1"
+
+
+def test_streamlit_entrypoint_imports_when_working_directory_is_app() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy; runpy.run_path('streamlit_app.py', run_name='streamlit_smoke')",
+        ],
+        cwd=PROJECT_ROOT / "app",
+        env={**os.environ, "PYTHONPATH": ""},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_api_client_maps_http_errors(monkeypatch) -> None:
